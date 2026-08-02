@@ -208,7 +208,7 @@ Schedule the scan. Never schedule the changes.
 
 ## The safety model is the point
 
-- Redact before review (emails, phone numbers, tokens, keys, provider-specific key shapes, private-key blocks, long opaque strings). A corpus test asserts secret shapes never survive redaction.
+- Redact before review (emails, phone numbers, tokens, keys, namespaced key variables such as `ANTHROPIC_API_KEY=`, provider-specific key shapes, URL credentials, private-key blocks, long or high-entropy opaque strings). A corpus test asserts secret shapes never survive redaction, and a companion test asserts ordinary evidence stays readable.
 - Store evidence references and short excerpts, not whole transcripts.
 - Detect real tool usage, not prose mentions.
 - Separate durable lessons from one-off incidents.
