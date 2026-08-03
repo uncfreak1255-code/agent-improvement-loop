@@ -2080,6 +2080,30 @@ class RedactionCorpusTests(unittest.TestCase):
         out = loop.redact("api_key=short12")
         self.assertNotIn("short12", out)
 
+
+    def test_short_explicit_whitespace_credentials_are_masked(self):
+        # Regression: the whitespace form uses a 12-character floor to avoid
+        # prose false positives, but explicit flags and key names are strong
+        # credential evidence and retain the prior 8-character floor.
+        cases = [
+            ("--api-key secret123", "secret123"),
+            ("--password hunter2xx", "hunter2xx"),
+            ("--token abcdefgh", "abcdefgh"),
+            ("api-key secret123", "secret123"),
+            ("client_secret hunter2xx", "hunter2xx"),
+        ]
+        for text, secret in cases:
+            out = loop.redact(text)
+            self.assertNotIn(secret, out, f"short credential survived: {text!r} -> {out!r}")
+
+        # Ambiguous prose remains readable.
+        for text in (
+            "token bucket rate limiter",
+            "the secret sauce is caching",
+            "password reset flow is broken",
+        ):
+            self.assertEqual(text, loop.redact(text))
+
     def test_url_credentials_masked_independently_of_the_email_rule(self):
         # Regression: `user:pass@host` was only ever masked as collateral damage
         # from the email pattern, which requires a dotted TLD. A password in a
