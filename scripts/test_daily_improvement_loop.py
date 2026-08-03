@@ -2104,6 +2104,15 @@ class RedactionCorpusTests(unittest.TestCase):
         ):
             self.assertEqual(text, loop.redact(text))
 
+
+    def test_schema_and_cache_key_labels_stay_readable(self):
+        for text in (
+            "foreign_key: customer_id",
+            "primary_key=reservation_id",
+            "cache_key user-profile",
+        ):
+            self.assertEqual(text, loop.redact(text), f"over-masked schema key: {text!r}")
+
     def test_url_credentials_masked_independently_of_the_email_rule(self):
         # Regression: `user:pass@host` was only ever masked as collateral damage
         # from the email pattern, which requires a dotted TLD. A password in a
