@@ -65,10 +65,11 @@ Detector knobs live in an optional JSON config (`~/.agent-improvement/config.jso
 
 ## Safety model
 
-- Redact emails, phone numbers, auth headers, cookies, API keys, tokens, cloud/SaaS key shapes (Stripe, Slack, Google, GitHub, GitLab, npm, AWS), private-key blocks, JWTs, URL credentials (`scheme://user:pass@host`, including hosts with no dotted TLD), and long or high-entropy opaque strings before writing excerpts. Keyword rules match namespaced environment variables (`ANTHROPIC_API_KEY=`, `SUPABASE_SERVICE_ROLE_KEY=`), not just a bare `api_key=`. A corpus test asserts secret shapes never survive redaction; a companion test asserts ordinary evidence — paths, URLs, identifiers, prose — stays readable.
+- Redact emails, phone numbers, auth headers, cookies, API keys, tokens, cloud/SaaS key shapes (Stripe, Slack, Google, GitHub, GitLab, npm, AWS), private-key blocks, JWTs, URL credentials (`scheme://user:pass@host`, including hosts with no dotted TLD), and long or high-entropy opaque strings before writing excerpts. Keyword rules match namespaced environment variables (`ANTHROPIC_API_KEY=`, `SUPABASE_SERVICE_ROLE_KEY=`), not just a bare `api_key=`. The generic high-entropy fallback requires a delimiter-free opaque run and preserves path, filename, and function contexts; a corpus test asserts secret shapes never survive redaction, while adversarial cases keep readable identifiers intact.
 - Every evidence record is built through `evidence()`, which is the only place redaction and shortening are applied. Constructing `Evidence(...)` directly bypasses both and must not be done.
 - Store evidence references and short excerpts, not whole transcripts.
 - For `content_idea`, treat real sessions as private source material. High-risk content evidence suppresses command/excerpt text even under `--full`; public drafts should use abstractions or synthetic examples.
+- Guest names, street addresses, and reservation codes are not currently inferred or masked because their shapes are ambiguous. Archive mining of guest-facing transcripts stays disabled until a source-specific policy and adversarial coverage exist; this repository change does not alter live workflows.
 - Keep public detector logic generic. Put private detector catalogs, local logs, and real dogfood output in an ignored `private/` directory or a private fork.
 - Treat transcript scaffolding as non-user text.
 - Keep scan/stage automation separate from apply automation.
