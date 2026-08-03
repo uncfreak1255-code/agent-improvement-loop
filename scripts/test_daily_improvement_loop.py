@@ -2052,6 +2052,206 @@ class RedactionCorpusTests(unittest.TestCase):
             self.assertNotIn(must_not_survive, out, f"secret survived redaction: {text!r} -> {out!r}")
             self.assertIn("<", out, f"no redaction marker in output for {text!r}")
 
+    def test_prefixed_env_var_secrets_never_survive_redaction(self):
+        # Regression: the keyword rules were anchored with `\b`, which cannot
+        # match at the `API` in `ANTHROPIC_API_KEY` because `_` and `A` are both
+        # word characters. Every namespaced environment variable — the single
+        # most common way a secret actually appears in a transcript — went
+        # through the masker untouched.
+        secret = "a1b2c3d4e5f6g7h8i9j0"
+        corpus = [
+            "ANTHROPIC_API_KEY=" + secret,
+            "export GITHUB_TOKEN=" + secret,
+            "HOSTAWAY_CLIENT_SECRET=" + secret,
+            "DB_PASSWORD=" + secret,
+            "MY_SECRET=" + secret,
+            "SUPABASE_SERVICE_ROLE_KEY=" + secret,
+            "env CLOUDFLARE_API_TOKEN=" + secret + " wrangler deploy",
+            "--db-password " + secret,
+            'headers={"X-Api-Key": "' + secret + '"}',
+        ]
+        for text in corpus:
+            out = loop.redact(text)
+            self.assertNotIn(secret, out, f"prefixed secret survived: {text!r} -> {out!r}")
+
+    def test_short_keyword_values_are_masked(self):
+        # Regression: the value floor was 8 characters, so a short-but-real
+        # secret slipped past the keyword rules entirely.
+        out = loop.redact("api_key=short12")
+        self.assertNotIn("short12", out)
+
+
+    def test_short_explicit_whitespace_credentials_are_masked(self):
+        # Regression: the whitespace form uses a 12-character floor to avoid
+        # prose false positives, but explicit flags and key names are strong
+        # credential evidence and retain the prior 8-character floor.
+        cases = [
+            ("--api-key secret123", "secret123"),
+            ("--password hunter2xx", "hunter2xx"),
+            ("--token abcdefgh", "abcdefgh"),
+            ("api-key secret123", "secret123"),
+            ("client_secret hunter2xx", "hunter2xx"),
+        ]
+        for text, secret in cases:
+            out = loop.redact(text)
+            self.assertNotIn(secret, out, f"short credential survived: {text!r} -> {out!r}")
+
+        # Ambiguous prose remains readable.
+        for text in (
+            "token bucket rate limiter",
+            "the secret sauce is caching",
+            "password reset flow is broken",
+        ):
+            self.assertEqual(text, loop.redact(text))
+
+
+    def test_schema_and_cache_key_labels_stay_readable(self):
+        for text in (
+            "foreign_key: customer_id",
+            "primary_key=reservation_id",
+            "cache_key user-profile",
+        ):
+            self.assertEqual(text, loop.redact(text), f"over-masked schema key: {text!r}")
+
+    def test_url_credentials_masked_independently_of_the_email_rule(self):
+        # Regression: `user:pass@host` was only ever masked as collateral damage
+        # from the email pattern, which requires a dotted TLD. A password in a
+        # `@localhost` or bare-hostname URL was never touched.
+        cases = [
+            "psql postgres://admin:sup3rp4ss@localhost:5432/db",
+            "redis://default:tokenvalue123@redis:6379/0",
+            "https://svcuser:hunter2hunter2@internal-host/path",
+        ]
+        for text in cases:
+            out = loop.redact(text)
+            self.assertNotIn("sup3rp4ss", out)
+            self.assertNotIn("tokenvalue123", out)
+            self.assertNotIn("hunter2hunter2", out)
+            self.assertIn("<redacted-url-password>", out, f"no url mask for {text!r}")
+        # The host must survive so the evidence is still readable.
+        self.assertIn("localhost", loop.redact(cases[0]))
+
+    def test_high_entropy_tokens_masked_without_eating_readable_evidence(self):
+        opaque = "7f3a9c2e5b8d1064af23e91c7d5b"
+        self.assertNotIn(opaque, loop.redact("blob " + opaque))
+        # Long identifiers, prose, and commit SHAs must stay legible.
+        keep = [
+            "generate_workflow_content_proposals",
+            "plugins/spine/skills/loopspine/SKILL.md",
+            "c75fe25a1b3d4e6f8901234567890abcdef01234",
+        ]
+        for text in keep:
+            self.assertEqual(text, loop.redact(text), f"over-masked readable text: {text!r}")
+
+
+    def test_identifier_filename_and_path_context_stays_readable(self):
+        # These names are long enough and varied enough to trip the old entropy
+        # fallback, but they are review-critical code references, not secrets.
+        readable = [
+            "src/oauth2_authentication_handler.py",
+            "db/migrations/20260802123456_add_guest_status.py",
+            "private/client_secret_backup.json",
+            "exports/secret_rotation_20260802.json",
+            "def parse_v2_reservation_code(value):",
+            "config/7f3a9c2e5b8d1064af23e91c7d5b.json",
+            "plugins/loopv2/skill_name",
+        ]
+        for text in readable:
+            self.assertEqual(text, loop.redact(text), f"over-masked reference: {text!r}")
+
+        # A versioned name without separators is still readable when it is
+        # clearly a filename or callable identifier.
+        self.assertEqual(
+            "src/oauth2authenticationhandler.py",
+            loop.redact("src/oauth2authenticationhandler.py"),
+        )
+        self.assertEqual(
+            "def parsev2reservationcode(value):",
+            loop.redact("def parsev2reservationcode(value):"),
+        )
+
+    def test_generated_tokens_still_mask_without_identifier_context(self):
+        generated = [
+            "7f3a9c2e5b8d1064af23e91c7d5b",
+            "Kx7pQ2mN9rT4vB6cL8zH1sJ5",
+        ]
+        for token in generated:
+            out = loop.redact("generated value " + token)
+            self.assertNotIn(token, out, f"generated token survived: {token!r} -> {out!r}")
+            self.assertIn("<redacted-high-entropy>", out)
+
+    def test_commit_shas_remain_readable(self):
+        shas = [
+            "c75fe25a1b3d4e6f8901234567890abcdef01234",
+            "8036dbeabce631b8053c432d97fae0f9ceca1ed7",
+        ]
+        for sha in shas:
+            self.assertEqual(sha, loop.redact(sha))
+
+    def test_namespaced_key_variables_are_masked(self):
+        # `SUPABASE_SERVICE_ROLE_KEY` is not `api_key`, but it is still a key.
+        secret = "eyJzdiiiii12345"
+        for text in (
+            "supabase_service_role_key: " + secret,
+            "SUPABASE_SERVICE_ROLE_KEY=" + secret,
+            "stripe-restricted-key=" + secret,
+        ):
+            self.assertNotIn(secret, loop.redact(text), f"unmasked: {text!r}")
+        # A bare `key` stays readable: structured data, not a credential.
+        self.assertEqual("key: reservation_id", loop.redact("key: reservation_id"))
+
+    def test_redaction_leaves_ordinary_evidence_readable(self):
+        # Masking too much is its own failure: the queue exists to be read.
+        # Each of these tripped an earlier revision of the rules above.
+        readable = [
+            "npx tsc --noEmit",
+            "tokenizer: fast",
+            "token bucket rate limiter",
+            "the secret sauce is caching",
+            "password reset flow is broken",
+            "https://github.com/cathrynlavery/agent-improvement-loop/issues/5",
+            "plugins/spine/skills/loopspine/SKILL.md",
+            "/Users/example/Projects/app/src/index.ts",
+            "def generate_workflow_content_proposals(sessions):",
+            "ERROR: connection refused at 127.0.0.1:5432",
+        ]
+        for text in readable:
+            self.assertEqual(text, loop.redact(text), f"over-masked: {text!r}")
+
+    def test_redaction_stays_linear_on_long_inputs(self):
+        # The email rule's unbounded quantifiers were quadratic: a 40k-character
+        # run with no `@` took seconds, and redact() runs on raw transcript text
+        # before any shortening. Bounded lengths keep it linear.
+        import time
+
+        probe = "A1" * 20000
+        started = time.monotonic()
+        loop.redact(probe)
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 1.0, f"redact() took {elapsed:.2f}s on 40k chars")
+
+    def test_workflow_evidence_from_tool_call_is_redacted(self):
+        # Regression: this builder constructed Evidence() by hand and therefore
+        # skipped redact() entirely, writing the raw shell command into the
+        # proposal queue no matter what the command contained.
+        secret = "a1b2c3d4e5f6g7h8i9j0"
+        call = loop.ToolCall(
+            call_id="c1",
+            name="Bash",
+            line=7,
+            command="export ANTHROPIC_API_KEY=" + secret,
+            occurred_at="2026-08-02T00:00:00Z",
+        )
+        session = loop.SessionSummary(
+            source="claude", path=Path("/tmp/session.jsonl"), session_id="s1"
+        )
+        ev = loop.workflow_evidence_from_tool_call(session, call)
+        self.assertNotIn(secret, ev.excerpt)
+        self.assertNotIn(secret, ev.command)
+        self.assertNotIn(secret, json.dumps(ev.as_dict()))
+        self.assertEqual("Bash", ev.tool_name)
+        self.assertEqual(7, ev.line)
+
 
 class ConfigAndHealthTests(unittest.TestCase):
     def _snapshot_globals(self):

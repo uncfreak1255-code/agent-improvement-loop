@@ -153,6 +153,8 @@ Fix workflows can import a batch handoff with `--resolve-from decisions.json`. T
 
 For `content_idea`, personal/private sessions are allowed as local source material, but the public output is intentionally conservative: high-risk content evidence suppresses command and excerpt text even when `--full` is enabled. Use the idea as a starting point, then remove names, raw messages, customer/client details, family details, auth material, exact private metrics, and any other identifying specifics before drafting or publishing.
 
+The current redactor deliberately does not guess at guest names, street addresses, or reservation codes. Those values have no universal shape, and a global name or address rule would either miss real people or erase useful technical evidence. Before any archive-mining mode is enabled for guest-facing transcripts, choose a source-specific policy (for example, an owner-verified roster or deterministic pseudonymization) and add it with adversarial tests. This release does not activate archive mining or change live workflows.
+
 ### From staged proposals to executed fixes
 
 Staging is half the loop. The other half — a scheduled headless triage pass that promotes/resolves/queues, and an interactive `learn-loop` session that executes the queue with test gates and closes every entry's status — is documented in [docs/CLOSING-THE-LOOP.md](docs/CLOSING-THE-LOOP.md), with a ready-to-adapt skill (`skills/learn-loop/`), the triage prompt and runner shim (`templates/`), and a LaunchAgent example (`examples/`).
@@ -208,7 +210,8 @@ Schedule the scan. Never schedule the changes.
 
 ## The safety model is the point
 
-- Redact before review (emails, phone numbers, tokens, keys, provider-specific key shapes, private-key blocks, long opaque strings). A corpus test asserts secret shapes never survive redaction.
+- Redact before review (emails, phone numbers, tokens, keys, namespaced key variables such as `ANTHROPIC_API_KEY=`, provider-specific key shapes, URL credentials, private-key blocks, long or high-entropy opaque strings). A corpus test asserts secret shapes never survive redaction, and a companion test asserts ordinary evidence stays readable.
+- Keep readable versioned identifiers, filenames, function names, and path components intact when the context identifies them as code references; the generic high-entropy fallback is intentionally limited to delimiter-free opaque runs. Guest names, street addresses, and reservation codes remain an explicit policy boundary, not an implicit masking promise.
 - Store evidence references and short excerpts, not whole transcripts.
 - Detect real tool usage, not prose mentions.
 - Separate durable lessons from one-off incidents.

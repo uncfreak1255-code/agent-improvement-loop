@@ -12,6 +12,7 @@ import argparse
 import datetime as dt
 import hashlib
 import json
+import math
 import os
 import re
 import shlex
@@ -370,24 +371,99 @@ BACKLOG_IGNORE_EXECUTABLES = {
     "which",
 }
 
+# A keyword rule must fire on `ANTHROPIC_API_KEY=...` and `--db-password ...`,
+# not just on a bare `api_key=...`. `\b` cannot do that: between the `_` and the
+# `A` of `_API` there is no word boundary, so every prefixed environment
+# variable slipped through unmasked. This zero-width lookbehind rejects only a
+# preceding letter or digit, so `_`, `-`, and `.` separators still start a
+# keyword match while group numbering stays intact for the replacements below.
+KEYWORD_BOUNDARY = r"(?<![A-Za-z0-9])"
+# `KEYWORD=value` and `KEYWORD: value` are strong evidence, so 6 characters is
+# enough to mask (8 was the old floor, which let `api_key=short12` through).
+# A bare space is weak evidence — `token bucket` is prose, `--password
+# correcthorsebattery` is not — so the whitespace form needs a longer value.
+DELIMITED_SECRET_VALUE = r"([\"'\s]*[:=][\"'\s]*)([^\"'\s,;]{6,})"
+SPACED_SECRET_VALUE = r"(\s+)([^\"'\s,;]{12,})"
+# Explicit command-line flags are strong evidence even when their values are
+# short. Keep the 8-character historical floor for `--api-key secret123` and
+# `--password hunter2xx`, while leaving bare prose keywords on the 12-character
+# floor below.
+SHORT_FLAG_SECRET_KEYWORDS = (
+    r"(--?(?:api[_-]?key|api[_-]?secret|auth[_-]?token|access[_-]?key|"
+    r"token|secret|password|passwd|passphrase|credential|session[_-]?cookie|"
+    r"service[_-]?role[_-]?key|restricted[_-]?key|secret[_-]?key|"
+    r"private[_-]?key|signing[_-]?key|encryption[_-]?key|webhook[_-]?key))"
+)
+# Structured key names without a flag marker are also explicit; bare `token`
+# and `secret` stay excluded so `token bucket` and `secret sauce` remain
+# readable.
+SHORT_SPACED_SECRET_KEYWORDS = (
+    r"(api[_-]?key|api[_-]?secret|auth[_-]?token|access[_-]?key|"
+    r"service[_-]?role[_-]?key|restricted[_-]?key|secret[_-]?key|"
+    r"private[_-]?key|signing[_-]?key|encryption[_-]?key|webhook[_-]?key|"
+    r"[a-z0-9]+[_-](?:token|secret)|client[_-]?secret|access[_-]?token|"
+    r"refresh[_-]?token|password|passwd|passphrase|credential|session[_-]?cookie)"
+)
+# `SUPABASE_SERVICE_ROLE_KEY`, `stripe-restricted-key`, and friends need
+# explicit secret-bearing families. A broad `<word>_key` wildcard would erase
+# ordinary schema/cache evidence such as `foreign_key` and `cache_key`.
+NAMESPACED_SECRET_KEYWORDS = (
+    r"(?:service[_-]?role|restricted|secret|private|signing|encryption|"
+    r"webhook|consumer|integration|client)[_-]key"
+)
+SECRET_KEYWORDS = (
+    r"(api[_-]?key|api[_-]?secret|auth[_-]?token|access[_-]?key|"
+    + NAMESPACED_SECRET_KEYWORDS + r"|token|secret|password|passwd|passphrase|"
+    r"credential|session[_-]?cookie)"
+)
+SECRET_KEYWORDS_EXTRA = (
+    r"(aws_?secret_?access_?key|secret_?access_?key|client_?secret|"
+    r"access_?token|refresh_?token)"
+)
+
 SECRET_PATTERNS: List[Tuple[re.Pattern[str], str]] = [
-    (re.compile(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}"), "<email>"),
+    # Must precede the email rule: `user:pass@host` would otherwise be consumed
+    # as an address, which masks the password only by accident and only when the
+    # host happens to carry a dotted TLD (never for `@localhost`).
+    (
+        re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)([^\s/:@]+):([^\s/@]+)@"),
+        r"\1\2:<redacted-url-password>@",
+    ),
+    # Local part and domain are length-bounded (RFC limits) so a long run of
+    # word characters with no `@` fails in linear rather than quadratic time.
+    (re.compile(r"[\w.+-]{1,64}@[\w.-]{1,255}\.[A-Za-z]{2,}"), "<email>"),
     (re.compile(r"(?i)(authorization:\s*)(bearer|basic)\s+[^\s,;]+"), r"\1<redacted-auth>"),
     (re.compile(r"(?i)(cookie:\s*)[^\n\r]+"), r"\1<redacted-cookie>"),
     (
+        re.compile(r"(?i)" + KEYWORD_BOUNDARY + SECRET_KEYWORDS + DELIMITED_SECRET_VALUE),
+        r"\1\2<redacted-secret>",
+    ),
+    (
         re.compile(
-            r"(?i)\b(api[_-]?key|token|secret|password|session[_-]?cookie)"
-            r"([\"'\s:=]+)([^\"'\s,;]{8,})"
+            r"(?i)" + KEYWORD_BOUNDARY + SHORT_FLAG_SECRET_KEYWORDS
+            + r"(\s+)([^\"'\s,;]{8,})"
         ),
+        r"\1\2<redacted-secret>",
+    ),
+    (
+        re.compile(
+            r"(?i)" + KEYWORD_BOUNDARY + SHORT_SPACED_SECRET_KEYWORDS
+            + r"(\s+)([^\"'\s,;]{8,})"
+        ),
+        r"\1\2<redacted-secret>",
+    ),
+    (
+        re.compile(r"(?i)" + KEYWORD_BOUNDARY + SECRET_KEYWORDS + SPACED_SECRET_VALUE),
         r"\1\2<redacted-secret>",
     ),
     (re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b"), "<redacted-openai-key>"),
     (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "<redacted-aws-key>"),
     (
-        re.compile(
-            r"(?i)\b(aws_?secret_?access_?key|secret_?access_?key|client_?secret|"
-            r"access_?token|refresh_?token)([\"'\s:=]+)([^\"'\s,;]{8,})"
-        ),
+        re.compile(r"(?i)" + KEYWORD_BOUNDARY + SECRET_KEYWORDS_EXTRA + DELIMITED_SECRET_VALUE),
+        r"\1\2<redacted-secret>",
+    ),
+    (
+        re.compile(r"(?i)" + KEYWORD_BOUNDARY + SECRET_KEYWORDS_EXTRA + SPACED_SECRET_VALUE),
         r"\1\2<redacted-secret>",
     ),
     (re.compile(r"\b[srp]k_(live|test)_[A-Za-z0-9]{16,}\b"), "<redacted-stripe-key>"),
@@ -407,6 +483,18 @@ SECRET_PATTERNS: List[Tuple[re.Pattern[str], str]] = [
     (re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{20,}"), "<redacted-auth>"),
     (re.compile(r"\b[A-Za-z0-9_+/=-]{56,}\b"), "<redacted-long-token>"),
 ]
+
+# Applied after SECRET_PATTERNS so a recognised shape keeps its precise label.
+# The generic fallback deliberately requires a delimiter-free opaque run.
+# Underscores and hyphens are structural evidence in versioned identifiers,
+# filenames, and function names; credential-shaped values with those characters
+# are still handled by the explicit rules above. A path component or filename
+# made only of opaque characters is also kept readable when its surrounding
+# slash, extension, or call syntax identifies it as code or a reference.
+HIGH_ENTROPY_CANDIDATE_RE = re.compile(
+    r"(?<![A-Za-z0-9+=_-])[A-Za-z0-9+=]{24,55}(?![A-Za-z0-9+=_-])"
+)
+HIGH_ENTROPY_FLOOR = 3.5
 
 # A user message that opens with an XML-ish tag is injected scaffolding
 # (system instructions, task seeds, notifications), not something the user
@@ -590,13 +678,68 @@ def shorten(text: str, limit: int = 360) -> str:
     return text[: limit - 1].rstrip() + "..."
 
 
+def shannon_entropy(value: str) -> float:
+    if not value:
+        return 0.0
+    total = len(value)
+    return -sum(
+        (count / total) * math.log2(count / total) for count in Counter(value).values()
+    )
+
+
+
+def is_readable_identifier_context(text: str, start: int, end: int) -> bool:
+    """Keep opaque-looking code references legible when their context proves it.
+
+    The generic token rule has no semantic label to rely on. A slash, a normal
+    filename extension, or a following call delimiter is strong local evidence
+    that the run is a path component, filename, or function name rather than a
+    credential. Known credential forms are matched before this callback and do
+    not depend on this heuristic.
+    """
+    before = text[start - 1] if start else ""
+    after = text[end] if end < len(text) else ""
+
+    if (before and before in "/\\") or (after and after in "/\\"):
+        return True
+    if before == "." or after == ".":
+        return True
+    if re.match(r"\s*\(", text[end:]):
+        return True
+    prefix = text[max(0, start - 24) : start]
+    return bool(re.search(r"\b(?:def|function|class)\s+$", prefix))
+
+
+def mask_high_entropy_token(match: "re.Match[str]") -> str:
+    """Mask a 24-55 char token that looks generated rather than written.
+
+    The literal patterns above only catch secrets whose shape is known, and the
+    catch-all below them starts at 56 characters. That leaves a wide gap where
+    an unrecognised key sits unmasked. Requiring both letters and digits plus a
+    real entropy floor keeps ordinary long identifiers (`generate_workflow_
+    content_proposals`) and 40-char commit SHAs readable in the evidence.
+    """
+    token = match.group(0)
+    if is_readable_identifier_context(match.string, match.start(), match.end()):
+        return token
+    if not any(ch.isdigit() for ch in token):
+        return token
+    if not any(ch.isalpha() for ch in token):
+        return token
+    if len(token) == 40 and all(ch in "0123456789abcdef" for ch in token):
+        return token
+    if shannon_entropy(token) < HIGH_ENTROPY_FLOOR:
+        return token
+    return "<redacted-high-entropy>"
+
+
 def redact(text: str) -> str:
     out = text or ""
     if FULL_DETAIL:
         return out
     for pattern, replacement in SECRET_PATTERNS:
         out = pattern.sub(replacement, out)
-    return out
+    return HIGH_ENTROPY_CANDIDATE_RE.sub(mask_high_entropy_token, out)
 
 
 def evidence(
@@ -1784,12 +1927,15 @@ def make_content_proposal(
 
 
 def workflow_evidence_from_tool_call(session: SessionSummary, call: ToolCall) -> Evidence:
-    return Evidence(
+    # Built through evidence() rather than Evidence() directly: constructing the
+    # record by hand skipped redact(), so a matched tool call wrote its raw shell
+    # command — `export ANTHROPIC_API_KEY=...` included — into the proposal queue.
+    return evidence(
         source=session.source,
-        path=str(session.path),
+        path=session.path,
         line=call.line,
         kind="workflow_signal",
-        excerpt=call.command,
+        text=call.command,
         session_id=session.session_id,
         tool_name=call.name,
         command=call.command,
