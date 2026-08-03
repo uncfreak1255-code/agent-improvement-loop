@@ -649,7 +649,6 @@ def shannon_entropy(value: str) -> float:
     )
 
 
-def mask_high_entropy_token(match: "re.Match[str]") -> str:
 
 def is_readable_identifier_context(text: str, start: int, end: int) -> bool:
     """Keep opaque-looking code references legible when their context proves it.
@@ -673,6 +672,7 @@ def is_readable_identifier_context(text: str, start: int, end: int) -> bool:
     return bool(re.search(r"\b(?:def|function|class)\s+$", prefix))
 
 
+def mask_high_entropy_token(match: "re.Match[str]") -> str:
     """Mask a 24-55 char token that looks generated rather than written.
 
     The literal patterns above only catch secrets whose shape is known, and the
