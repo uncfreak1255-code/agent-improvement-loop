@@ -384,6 +384,22 @@ KEYWORD_BOUNDARY = r"(?<![A-Za-z0-9])"
 # correcthorsebattery` is not — so the whitespace form needs a longer value.
 DELIMITED_SECRET_VALUE = r"([\"'\s]*[:=][\"'\s]*)([^\"'\s,;]{6,})"
 SPACED_SECRET_VALUE = r"(\s+)([^\"'\s,;]{12,})"
+# Explicit command-line flags are strong evidence even when their values are
+# short. Keep the 8-character historical floor for `--api-key secret123` and
+# `--password hunter2xx`, while leaving bare prose keywords on the 12-character
+# floor below.
+SHORT_FLAG_SECRET_KEYWORDS = (
+    r"(--?(?:api[_-]?key|api[_-]?secret|auth[_-]?token|access[_-]?key|"
+    r"token|secret|password|passwd|passphrase|credential|session[_-]?cookie))"
+)
+# Structured key names without a flag marker are also explicit; bare `token`
+# and `secret` stay excluded so `token bucket` and `secret sauce` remain
+# readable.
+SHORT_SPACED_SECRET_KEYWORDS = (
+    r"(api[_-]?key|api[_-]?secret|auth[_-]?token|access[_-]?key|"
+    r"[a-z0-9]+[_-]key|client[_-]?secret|access[_-]?token|refresh[_-]?token|"
+    r"password|passwd|passphrase|credential|session[_-]?cookie)"
+)
 # `SUPABASE_SERVICE_ROLE_KEY`, `stripe-restricted-key`, and friends: any
 # `<word>_key` counts. A bare `key` deliberately does not — `key: name` is
 # ordinary structured data, not a credential.
@@ -412,6 +428,20 @@ SECRET_PATTERNS: List[Tuple[re.Pattern[str], str]] = [
     (re.compile(r"(?i)(cookie:\s*)[^\n\r]+"), r"\1<redacted-cookie>"),
     (
         re.compile(r"(?i)" + KEYWORD_BOUNDARY + SECRET_KEYWORDS + DELIMITED_SECRET_VALUE),
+        r"\1\2<redacted-secret>",
+    ),
+    (
+        re.compile(
+            r"(?i)" + KEYWORD_BOUNDARY + SHORT_FLAG_SECRET_KEYWORDS
+            + r"(\s+)([^\"'\s,;]{8,})"
+        ),
+        r"\1\2<redacted-secret>",
+    ),
+    (
+        re.compile(
+            r"(?i)" + KEYWORD_BOUNDARY + SHORT_SPACED_SECRET_KEYWORDS
+            + r"(\s+)([^\"'\s,;]{8,})"
+        ),
         r"\1\2<redacted-secret>",
     ),
     (
