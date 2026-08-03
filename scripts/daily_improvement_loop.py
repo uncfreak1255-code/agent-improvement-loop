@@ -390,23 +390,31 @@ SPACED_SECRET_VALUE = r"(\s+)([^\"'\s,;]{12,})"
 # floor below.
 SHORT_FLAG_SECRET_KEYWORDS = (
     r"(--?(?:api[_-]?key|api[_-]?secret|auth[_-]?token|access[_-]?key|"
-    r"token|secret|password|passwd|passphrase|credential|session[_-]?cookie))"
+    r"token|secret|password|passwd|passphrase|credential|session[_-]?cookie|"
+    r"service[_-]?role[_-]?key|restricted[_-]?key|secret[_-]?key|"
+    r"private[_-]?key|signing[_-]?key|encryption[_-]?key|webhook[_-]?key))"
 )
 # Structured key names without a flag marker are also explicit; bare `token`
 # and `secret` stay excluded so `token bucket` and `secret sauce` remain
 # readable.
 SHORT_SPACED_SECRET_KEYWORDS = (
     r"(api[_-]?key|api[_-]?secret|auth[_-]?token|access[_-]?key|"
-    r"[a-z0-9]+[_-]key|client[_-]?secret|access[_-]?token|refresh[_-]?token|"
-    r"password|passwd|passphrase|credential|session[_-]?cookie)"
+    r"service[_-]?role[_-]?key|restricted[_-]?key|secret[_-]?key|"
+    r"private[_-]?key|signing[_-]?key|encryption[_-]?key|webhook[_-]?key|"
+    r"[a-z0-9]+[_-](?:token|secret)|client[_-]?secret|access[_-]?token|"
+    r"refresh[_-]?token|password|passwd|passphrase|credential|session[_-]?cookie)"
 )
-# `SUPABASE_SERVICE_ROLE_KEY`, `stripe-restricted-key`, and friends: any
-# `<word>_key` counts. A bare `key` deliberately does not — `key: name` is
-# ordinary structured data, not a credential.
+# `SUPABASE_SERVICE_ROLE_KEY`, `stripe-restricted-key`, and friends need
+# explicit secret-bearing families. A broad `<word>_key` wildcard would erase
+# ordinary schema/cache evidence such as `foreign_key` and `cache_key`.
+NAMESPACED_SECRET_KEYWORDS = (
+    r"(?:service[_-]?role|restricted|secret|private|signing|encryption|"
+    r"webhook|consumer|integration|client)[_-]key"
+)
 SECRET_KEYWORDS = (
     r"(api[_-]?key|api[_-]?secret|auth[_-]?token|access[_-]?key|"
-    r"[a-z0-9]+[_-]key|token|secret|password|passwd|passphrase|credential|"
-    r"session[_-]?cookie)"
+    + NAMESPACED_SECRET_KEYWORDS + r"|token|secret|password|passwd|passphrase|"
+    r"credential|session[_-]?cookie)"
 )
 SECRET_KEYWORDS_EXTRA = (
     r"(aws_?secret_?access_?key|secret_?access_?key|client_?secret|"
