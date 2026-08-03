@@ -447,12 +447,14 @@ SECRET_PATTERNS: List[Tuple[re.Pattern[str], str]] = [
 ]
 
 # Applied after SECRET_PATTERNS so a recognised shape keeps its precise label.
-# `/` is excluded from the candidate: with it, the rule swallowed URL and file
-# paths (`github.com/owner/repo/issues/5`), which are the most useful evidence
-# in the queue. Base64 secrets long enough to need `/` are caught by the 56+
-# rule above.
+# The generic fallback deliberately requires a delimiter-free opaque run.
+# Underscores and hyphens are structural evidence in versioned identifiers,
+# filenames, and function names; credential-shaped values with those characters
+# are still handled by the explicit rules above. A path component or filename
+# made only of opaque characters is also kept readable when its surrounding
+# slash, extension, or call syntax identifies it as code or a reference.
 HIGH_ENTROPY_CANDIDATE_RE = re.compile(
-    r"(?<![A-Za-z0-9+=_-])[A-Za-z0-9+=_-]{24,55}(?![A-Za-z0-9+=_-])"
+    r"(?<![A-Za-z0-9+=_-])[A-Za-z0-9+=]{24,55}(?![A-Za-z0-9+=_-])"
 )
 HIGH_ENTROPY_FLOOR = 3.5
 
@@ -648,6 +650,29 @@ def shannon_entropy(value: str) -> float:
 
 
 def mask_high_entropy_token(match: "re.Match[str]") -> str:
+
+def is_readable_identifier_context(text: str, start: int, end: int) -> bool:
+    """Keep opaque-looking code references legible when their context proves it.
+
+    The generic token rule has no semantic label to rely on. A slash, a normal
+    filename extension, or a following call delimiter is strong local evidence
+    that the run is a path component, filename, or function name rather than a
+    credential. Known credential forms are matched before this callback and do
+    not depend on this heuristic.
+    """
+    before = text[start - 1] if start else ""
+    after = text[end] if end < len(text) else ""
+
+    if (before and before in "/\\") or (after and after in "/\\"):
+        return True
+    if before == "." or after == ".":
+        return True
+    if re.match(r"\s*\(", text[end:]):
+        return True
+    prefix = text[max(0, start - 24) : start]
+    return bool(re.search(r"\b(?:def|function|class)\s+$", prefix))
+
+
     """Mask a 24-55 char token that looks generated rather than written.
 
     The literal patterns above only catch secrets whose shape is known, and the
@@ -657,6 +682,8 @@ def mask_high_entropy_token(match: "re.Match[str]") -> str:
     content_proposals`) and 40-char commit SHAs readable in the evidence.
     """
     token = match.group(0)
+    if is_readable_identifier_context(match.string, match.start(), match.end()):
+        return token
     if not any(ch.isdigit() for ch in token):
         return token
     if not any(ch.isalpha() for ch in token):
