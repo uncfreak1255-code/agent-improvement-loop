@@ -2110,6 +2110,51 @@ class RedactionCorpusTests(unittest.TestCase):
         for text in keep:
             self.assertEqual(text, loop.redact(text), f"over-masked readable text: {text!r}")
 
+
+    def test_identifier_filename_and_path_context_stays_readable(self):
+        # These names are long enough and varied enough to trip the old entropy
+        # fallback, but they are review-critical code references, not secrets.
+        readable = [
+            "src/oauth2_authentication_handler.py",
+            "db/migrations/20260802123456_add_guest_status.py",
+            "private/client_secret_backup.json",
+            "exports/secret_rotation_20260802.json",
+            "def parse_v2_reservation_code(value):",
+            "config/7f3a9c2e5b8d1064af23e91c7d5b.json",
+            "plugins/loopv2/skill_name",
+        ]
+        for text in readable:
+            self.assertEqual(text, loop.redact(text), f"over-masked reference: {text!r}")
+
+        # A versioned name without separators is still readable when it is
+        # clearly a filename or callable identifier.
+        self.assertEqual(
+            "src/oauth2authenticationhandler.py",
+            loop.redact("src/oauth2authenticationhandler.py"),
+        )
+        self.assertEqual(
+            "def parsev2reservationcode(value):",
+            loop.redact("def parsev2reservationcode(value):"),
+        )
+
+    def test_generated_tokens_still_mask_without_identifier_context(self):
+        generated = [
+            "7f3a9c2e5b8d1064af23e91c7d5b",
+            "Kx7pQ2mN9rT4vB6cL8zH1sJ5",
+        ]
+        for token in generated:
+            out = loop.redact("generated value " + token)
+            self.assertNotIn(token, out, f"generated token survived: {token!r} -> {out!r}")
+            self.assertIn("<redacted-high-entropy>", out)
+
+    def test_commit_shas_remain_readable(self):
+        shas = [
+            "c75fe25a1b3d4e6f8901234567890abcdef01234",
+            "8036dbeabce631b8053c432d97fae0f9ceca1ed7",
+        ]
+        for sha in shas:
+            self.assertEqual(sha, loop.redact(sha))
+
     def test_namespaced_key_variables_are_masked(self):
         # `SUPABASE_SERVICE_ROLE_KEY` is not `api_key`, but it is still a key.
         secret = "eyJzdiiiii12345"
