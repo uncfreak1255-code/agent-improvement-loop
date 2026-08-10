@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Mine local Claude/Codex sessions for self-improvement candidates.
+"""Mine local agent sessions for self-improvement candidates.
 
 The command is intentionally conservative: it scans transcripts, writes a
 proposal queue and a compact review packet, and never applies changes to skills,
@@ -9,25 +9,22 @@ memory, runbooks, source code.
 from __future__ import annotations
 
 import argparse
+import copy
 import datetime as dt
 import hashlib
 import json
 import os
 import re
 import shlex
+import socket
+import sqlite3
 import sys
-from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
 SCHEMA_VERSION = 1
-CONTENT_PRIVACY_NOTICE = (
-    "This tool reads local agent transcripts. For content_idea output, treat sessions as "
-    "private source material: mine personal context locally, but remove names, messages, "
-    "customer/client details, family details, secrets, and exact sensitive data before publishing."
-)
 DEFAULT_OUTPUT_ROOT = Path.home() / ".agent-improvement"
 DEFAULT_CONFIG_PATH = DEFAULT_OUTPUT_ROOT / "config.json"
 RESOLUTION_DECISIONS = {"fixed", "wontfix", "ignored"}
@@ -41,25 +38,24 @@ CORRECTION_SCAN_LIMIT = 360
 
 # CLIs whose command name ends in this suffix get the `tool` route. Override
 # with "tracked_cli_suffix" in the config file to track your own naming scheme.
-TRACKED_CLI_SUFFIX = "-pp-cli"
+TRACKED_CLI_SUFFIX = "-cli"
 
 
 def _build_tracked_cli_res(suffix: str) -> Tuple[re.Pattern[str], re.Pattern[str]]:
     esc = re.escape(suffix)
     loose = re.compile(rf"(?<![\w.-])([A-Za-z0-9][A-Za-z0-9._-]*{esc})(?=$|[\s;&|)])")
     # Anchored form, used to reject malformed names the tokenizer can pick up
-    # from shell quoting or transcript scaffolding (e.g. "'wavespeed-pp-cli",
-    # "$c-pp-cli", "===x-twitter-pp-cli") before they ever become a proposal.
+    # from shell quoting or transcript scaffolding (e.g. "'media-cli",
+    # "$c-cli", "===social-cli") before they ever become a proposal.
     anchored = re.compile(rf"^[A-Za-z0-9][A-Za-z0-9._-]*{esc}$")
     return loose, anchored
 
 
-PP_CLI_RE, VALID_PP_CLI_RE = _build_tracked_cli_res(TRACKED_CLI_SUFFIX)
+TRACKED_CLI_RE, VALID_TRACKED_CLI_RE = _build_tracked_cli_res(TRACKED_CLI_SUFFIX)
 ENV_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*")
 SHELL_SEPARATORS = {";", "&&", "||", "|", "do", "then", "else"}
 COMMAND_PREFIXES = {"command", "env", "noglob", "time"}
 REMOTE_COMMAND_WRAPPERS = {"bash", "kssh", "kssh_once", "sh", "ssh", "zsh"}
-SLASH_COMMAND_RE = re.compile(r"(?m)^\s*/([a-z][A-Za-z0-9:_-]*)\b")
 # Corrections are split into strong cues (explicitly corrective phrases) and
 # weak cues (words that also appear constantly in ordinary specs and prompts —
 # "do not", "instead", "actually"). Weak cues only count in short, reactive
@@ -103,7 +99,7 @@ FAILURE_RE = re.compile(
 BAD_EXIT_RE = re.compile(r"(?i)(process exited with code|exit code)[:\s]+[1-9]\d*\b")
 GOOD_EXIT_RE = re.compile(r"(?i)(process exited with code|exit code)[:\s]+0\b")
 COMPLETED_TOOL_RESULT_RE = re.compile(r"(?i)\bscript completed\b")
-PP_FRICTION_RE = re.compile(
+TRACKED_CLI_FRICTION_RE = re.compile(
     r"(?i)\b("
     r"FAIL|not configured|missing required|unknown option|usage:|"
     r"not found|invalid|unauthorized|forbidden|rate limit|silent null"
@@ -111,7 +107,7 @@ PP_FRICTION_RE = re.compile(
 )
 # Hard error phrases that outrank the inspection-command exemption below:
 # help/doctor output that contains these is real friction, not documentation.
-PP_STRONG_FRICTION_RE = re.compile(
+TRACKED_CLI_STRONG_FRICTION_RE = re.compile(
     r"(?i)("
     r"\bFAIL\b|\bnot configured\b|\bmissing required\b|"
     r"\bunknown (option|flag)\b|\binvalid (option|flag|argument)\b|"
@@ -130,8 +126,7 @@ TOOLING_FRICTION_RE = re.compile(
     r")\b"
 )
 # "Stuck"/hang signals: the CLI did not cleanly fail, it stalled, timed out, or
-# was canceled. This is friction even without a non-zero exit, and is a common
-# printing-press CLI smell the failure regex alone would miss.
+# was canceled. This is friction even without a non-zero exit.
 HANG_RE = re.compile(
     r"(?i)("
     r"timed out|timeout|deadline exceeded|context deadline|operation canceled|"
@@ -199,135 +194,10 @@ SILENT_EMPTY_IGNORE_EXECUTABLES = {
     "touch",
 }
 DETECT_SILENT_EMPTY = True
-# A *-pp-cli invoked at least this many times in a single session can be
+# A tracked CLI invoked at least this many times in a single session can be
 # retry-before-success friction when corroborated by failure/hang evidence or
 # same-subcommand flag variation.
 RETRY_STUCK_THRESHOLD = 3
-# Reject code-literal-only names that cannot be resolved against an available
-# printing-press source tree. This is config-gated for installations that use
-# tracked CLI names without a local source checkout.
-VALIDATE_PP_CLI_CANDIDATES = True
-CONTENT_CLI_IGNORE = {
-    "",
-    "#",
-    "bash",
-    "cat",
-    "cd",
-    "curl",
-    "echo",
-    "env",
-    "export",
-    "find",
-    "grep",
-    "jq",
-    "kill",
-    "ls",
-    "ps",
-    "sh",
-    "sleep",
-    "source",
-    "which",
-    "zsh",
-}
-CONTENT_SLASH_COMMANDS = {
-    "investigate": {
-        "title": "How I use /investigate to debug agents before fixing code",
-        "content_type": "how_to",
-        "query": "coding agents root cause debugging slash commands Claude Code Codex",
-        "audience": ["agent builders", "engineering leads", "Claude Code and Codex users"],
-    },
-    "gstack": {
-        "title": "How I use /gstack for browser QA with agents",
-        "content_type": "tutorial",
-        "query": "agent browser QA visual testing gstack coding agents",
-        "audience": ["AI app builders", "frontend engineers", "agent operators"],
-    },
-    "last30days": {
-        "title": "How I check what people actually care about before writing or building",
-        "content_type": "case_study",
-        "query": "social listening last 30 days Reddit X YouTube research agents",
-        "audience": ["founders", "content operators", "agent builders"],
-    },
-}
-PRIVATE_CONTENT_RE = re.compile(
-    r"(?i)\b(imessage|sms|text messages?|message threads?|contacts?|phone|family|"
-    r"client|customer|health|medical|daycare|school|calendar|gmail|email|inbox)\b"
-)
-BUILD_CONTENT_RE = re.compile(
-    r"(?i)\b(sqlite|database|search|crm|import_|export_|index|transcript|agent|"
-    r"workflow|skill|slash command|task ledger|hermes|codex|claude code)\b"
-)
-CONTENT_WORKFLOW_PATTERNS = [
-    {
-        "name": "task_ledger",
-        "regex": re.compile(r"(?i)(TASK_LEDGER_API_URL|ISSUE_TRACKER_API_URL|/api/issues/|task-ledger-update\.sh|/checkout\b)"),
-        "min_signals": 2,
-        "title": "How I turn agent work into a task ledger instead of chat chaos",
-        "content_type": "case_study",
-        "query": "AI agents task ledger issue tracker agent operations workflows",
-        "audience": ["founders", "agent operators", "engineering managers"],
-        "why": [
-            "It shows the operational layer that makes many agents manageable.",
-            "It is a concrete antidote to agents disappearing into chat logs.",
-        ],
-        "outline": [
-            "The problem: agent work disappears when it only lives in chat",
-            "The task-ledger pattern: checkout, heartbeat, update, close",
-            "How to make agent work auditable without micromanaging it",
-            "What belongs in the ledger vs. what stays in private transcripts",
-            "How readers can copy the loop with their own tracker",
-        ],
-        "recommendation": "write_now",
-        "confidence": 0.78,
-    },
-    {
-        "name": "executive_assistant_sweep",
-        "regex": re.compile(r"(?i)(gog gmail|gmail search|gmail thread|calendar events|calendar list|inbox sweep)"),
-        "min_signals": 2,
-        "title": "How I use agents as an executive assistant without handing them my whole life",
-        "content_type": "how_to",
-        "query": "AI executive assistant inbox calendar triage agents privacy workflow",
-        "audience": ["founders", "operators", "busy parents building with AI"],
-        "why": [
-            "It is a real workflow with high reader pull: inbox and calendar triage without generic assistant fluff.",
-            "It has a useful privacy angle because the public version must teach boundaries, not expose details.",
-        ],
-        "outline": [
-            "The problem: the inbox and calendar are context, not just notifications",
-            "The sweep loop: collect, classify, escalate, draft, close",
-            "The privacy boundary: what the agent can inspect vs. what it can share",
-            "How to make the output decision-ready instead of noisy",
-            "A copyable version using synthetic examples",
-        ],
-        "recommendation": "needs_context",
-        "confidence": 0.74,
-    },
-    {
-        "name": "revenue_watch",
-        "regex": re.compile(r"(?i)(revenue-pp-cli|metric-aggregates|flow-decay|campaign-values-report|flow-values-report|revenue watch)"),
-        "min_signals": 3,
-        "title": "How to make agents run a daily revenue watch instead of checking dashboards",
-        "content_type": "tutorial",
-        "query": "AI agents daily revenue monitoring dashboard automation ecommerce",
-        "audience": ["ecommerce founders", "growth operators", "agent builders"],
-        "why": [
-            "It turns dashboard checking into an agent-run operating cadence.",
-            "It is useful even when the exact business metrics stay private.",
-        ],
-        "outline": [
-            "The problem: dashboards are passive and easy to ignore",
-            "The watch loop: pull metrics, compare decay, flag anomalies, write the brief",
-            "What the agent should calculate vs. what a human decides",
-            "How to anonymize the data for a public walkthrough",
-            "A lightweight implementation path",
-        ],
-        "recommendation": "needs_context",
-        "confidence": 0.76,
-    },
-]
-# Where printing-press CLI source trees live, so a tool proposal can point at the
-# actual CLI to fix (and the amend/reprint workflow), not just name it.
-PRINTING_PRESS_ROOT_DEFAULT = "~/printing-press"
 BACKLOG_IGNORE_EXECUTABLES = {
     "",
     "-v",
@@ -441,6 +311,7 @@ class Evidence:
     tool_name: str = ""
     command: str = ""
     occurred_at: str = ""
+    machine: str = ""
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -452,6 +323,7 @@ class Evidence:
             "tool_name": self.tool_name,
             "command": self.command,
             "occurred_at": self.occurred_at,
+            "machine": self.machine,
             "excerpt": self.excerpt,
         }
 
@@ -475,22 +347,21 @@ class SessionSummary:
     cwd: str = ""
     started_at: str = ""
     ended_at: str = ""
+    machine: str = ""
     tool_calls: List[ToolCall] = field(default_factory=list)
-    pp_cli_invocations: Dict[str, List[Evidence]] = field(default_factory=dict)
+    tracked_cli_invocations: Dict[str, List[Evidence]] = field(default_factory=dict)
     skill_invocations: Dict[str, List[Evidence]] = field(default_factory=dict)
-    slash_commands: Dict[str, List[Evidence]] = field(default_factory=dict)
     failures: List[Evidence] = field(default_factory=list)
     silent_empty: List[Evidence] = field(default_factory=list)
     corrections: List[Evidence] = field(default_factory=list)
 
     def has_signal(self) -> bool:
         return bool(
-            self.pp_cli_invocations
+            self.tracked_cli_invocations
             or self.skill_invocations
             or self.failures
             or self.silent_empty
             or self.corrections
-            or self.slash_commands
         )
 
     def as_dict(self) -> Dict[str, Any]:
@@ -501,10 +372,10 @@ class SessionSummary:
             "cwd": self.cwd,
             "started_at": self.started_at,
             "ended_at": self.ended_at,
+            "machine": self.machine,
             "tool_call_count": len(self.tool_calls),
-            "pp_cli_names": sorted(self.pp_cli_invocations),
+            "tracked_cli_names": sorted(self.tracked_cli_invocations),
             "skill_names": sorted(self.skill_invocations),
-            "slash_commands": sorted(self.slash_commands),
             "failure_count": len(self.failures),
             "silent_empty_count": len(self.silent_empty),
             "correction_count": len(self.corrections),
@@ -599,6 +470,27 @@ def redact(text: str) -> str:
     return out
 
 
+def redact_for_fleet(text: str) -> str:
+    """Always redact a fleet-bound string, even when local --full mode is set."""
+    out = text or ""
+    for pattern, replacement in SECRET_PATTERNS:
+        out = pattern.sub(replacement, out)
+    return out
+
+
+def redact_structure_for_fleet(value: Any) -> Any:
+    """Recursively sanitize every string crossing a machine boundary."""
+    if isinstance(value, str):
+        return redact_for_fleet(value)
+    if isinstance(value, dict):
+        return {key: redact_structure_for_fleet(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [redact_structure_for_fleet(item) for item in value]
+    if isinstance(value, tuple):
+        return [redact_structure_for_fleet(item) for item in value]
+    return value
+
+
 def evidence(
     *,
     source: str,
@@ -610,6 +502,7 @@ def evidence(
     tool_name: str = "",
     command: str = "",
     occurred_at: Any = "",
+    machine: str = "",
 ) -> Evidence:
     return Evidence(
         source=source,
@@ -621,7 +514,29 @@ def evidence(
         tool_name=tool_name,
         command=shorten(redact(command), 220),
         occurred_at=isoformat_utc(parsed) if (parsed := parse_time(occurred_at)) else "",
+        machine=machine,
     )
+
+
+def normalized_machine_name(value: str = "") -> str:
+    raw = (value or socket.gethostname()).split(".", 1)[0].strip().lower()
+    slug = re.sub(r"[^a-z0-9_-]+", "-", raw).strip("-")
+    return slug or "unknown-machine"
+
+
+def stamp_session_machine(summary: SessionSummary, machine: str) -> None:
+    """Attach fleet provenance to a parsed session and every evidence item."""
+    summary.machine = machine
+    evidence_groups: List[Iterable[Evidence]] = [
+        summary.failures,
+        summary.silent_empty,
+        summary.corrections,
+    ]
+    evidence_groups.extend(summary.tracked_cli_invocations.values())
+    evidence_groups.extend(summary.skill_invocations.values())
+    for group in evidence_groups:
+        for item in group:
+            item.machine = machine
 
 
 def jsonl_records(path: Path) -> Iterable[Tuple[int, Dict[str, Any]]]:
@@ -691,6 +606,12 @@ def is_transcript_scaffold(text: str, path: Optional[Path] = None) -> bool:
         "<scheduled-task",
         "compound codex tool mapping",
         "<task-notification>",
+        "[context compaction",
+        "[the user sent a text document",
+        "delivery:",
+        "# porter",
+        "# atlas",
+        "# athena",
         "## tracegrain runtime request",
         "weekly learnings harvest.",
         "monthly learnings review.",
@@ -732,11 +653,11 @@ def is_user_correction_text(text: str, path: Optional[Path] = None) -> bool:
     return len(stripped) <= WEAK_CORRECTION_MAX_CHARS and bool(WEAK_CORRECTION_RE.search(window))
 
 
-def add_pp_cli_evidence(summary: SessionSummary, cli: str, ev: Evidence) -> None:
-    summary.pp_cli_invocations.setdefault(cli, []).append(ev)
+def add_tracked_cli_evidence(summary: SessionSummary, cli: str, ev: Evidence) -> None:
+    summary.tracked_cli_invocations.setdefault(cli, []).append(ev)
 
 
-def capture_pp_cli_hang(
+def capture_tracked_cli_hang(
     summary: SessionSummary,
     source: str,
     path: Path,
@@ -746,7 +667,7 @@ def capture_pp_cli_hang(
     clis: Optional[List[str]] = None,
     occurred_at: Any = "",
 ) -> None:
-    """Record a non-failing pp-cli result that stalled or timed out.
+    """Record a non-failing tracked CLI result that stalled or timed out.
 
     A clean timeout/cancel does not trip the failure regex, so without this the
     "stuck" case the loop is meant to catch would be invisible. Only called for
@@ -763,17 +684,17 @@ def capture_pp_cli_hang(
     # conservative: their output commonly documents timeouts and cancellation.
     # Strong friction language is the exception — a help/doctor probe that
     # comes back with a hard error phrase is real evidence, not documentation.
-    if INSPECTION_COMMAND_RE.search(command) and not PP_STRONG_FRICTION_RE.search(output):
+    if INSPECTION_COMMAND_RE.search(command) and not TRACKED_CLI_STRONG_FRICTION_RE.search(output):
         return
-    for cli in (clis if clis is not None else pp_cli_names(command)):
-        add_pp_cli_evidence(
+    for cli in (clis if clis is not None else tracked_cli_names(command)):
+        add_tracked_cli_evidence(
             summary,
             cli,
             evidence(
                 source=source,
                 path=path,
                 line=line_no,
-                kind="pp_cli_hang",
+                kind="tracked_cli_hang",
                 text=output,
                 session_id=summary.session_id,
                 tool_name="Bash",
@@ -820,11 +741,11 @@ def strip_heredoc_bodies(command: str) -> str:
         search_from = body_start + 1
 
 
-def pp_cli_names(command: str) -> List[str]:
-    return sorted(_pp_cli_names(command or "", depth=0))
+def tracked_cli_names(command: str) -> List[str]:
+    return sorted(_tracked_cli_names(command or "", depth=0))
 
 
-def pp_cli_names_from_code(text: str) -> List[str]:
+def tracked_cli_names_from_code(text: str) -> List[str]:
     """Extract tracked-CLI names from string literals inside code-shaped input.
 
     Current Codex sessions execute tools through a JavaScript runtime, so the
@@ -838,15 +759,15 @@ def pp_cli_names_from_code(text: str) -> List[str]:
     for match in CODE_SHELL_STRING_RE.finditer(text):
         # JavaScript string literals preserve shell newlines/tabs as escape
         # sequences in the transcript. POSIX shlex treats the backslash as an
-        # escape and would otherwise fuse `true\ncloudflare-pp-cli` into the
-        # fabricated command name `truencloudflare-pp-cli`.
+        # escape and would otherwise fuse `true\nedge-cli` into the
+        # fabricated command name `malformed-edge-cli`.
         literal = match.group(2).replace(r"\n", "\n").replace(r"\t", "\t")
         if TRACKED_CLI_SUFFIX in literal:
-            names.update(_pp_cli_names(literal, depth=1))
+            names.update(_tracked_cli_names(literal, depth=1))
     return sorted(names)
 
 
-def pp_cli_argv_shapes(command: str, cli: str) -> List[Tuple[str, Tuple[str, ...]]]:
+def tracked_cli_argv_shapes(command: str, cli: str) -> List[Tuple[str, Tuple[str, ...]]]:
     """Return (subcommand, flags) shapes for a tracked CLI invocation.
 
     Shape comparison deliberately ignores positional values. Retry evidence is
@@ -889,13 +810,13 @@ def has_retry_shape_variation(invocations: List[Evidence], cli: str) -> bool:
     """True when one subcommand was tried with more than one flag shape."""
     by_subcommand: Dict[str, set[Tuple[str, ...]]] = {}
     for item in invocations:
-        for subcommand, flags in pp_cli_argv_shapes(item.command, cli):
+        for subcommand, flags in tracked_cli_argv_shapes(item.command, cli):
             if subcommand:
                 by_subcommand.setdefault(subcommand, set()).add(flags)
     return any(len(flag_shapes) > 1 for flag_shapes in by_subcommand.values())
 
 
-def _pp_cli_names(command: str, depth: int) -> set[str]:
+def _tracked_cli_names(command: str, depth: int) -> set[str]:
     if depth > 2 or TRACKED_CLI_SUFFIX not in command:
         return set()
 
@@ -928,41 +849,41 @@ def _pp_cli_names(command: str, depth: int) -> set[str]:
             if basename in REMOTE_COMMAND_WRAPPERS:
                 for nested in tokens[index + 1 :]:
                     if TRACKED_CLI_SUFFIX in nested:
-                        names.update(_pp_cli_names(nested, depth + 1))
+                        names.update(_tracked_cli_names(nested, depth + 1))
                 continue
 
         if current_executable == "source":
             if basename in {"kssh", "kssh_once"}:
                 for nested in tokens[index + 1 :]:
                     if TRACKED_CLI_SUFFIX in nested:
-                        names.update(_pp_cli_names(nested, depth + 1))
+                        names.update(_tracked_cli_names(nested, depth + 1))
                 continue
         if current_executable in REMOTE_COMMAND_WRAPPERS and TRACKED_CLI_SUFFIX in token:
-            names.update(_pp_cli_names(token, depth + 1))
+            names.update(_tracked_cli_names(token, depth + 1))
 
-    names.update(pp_cli_names_from_for_loop(command))
+    names.update(tracked_cli_names_from_for_loop(command))
     return names
 
 
-def pp_cli_names_from_for_loop(command: str) -> set[str]:
+def tracked_cli_names_from_for_loop(command: str) -> set[str]:
     names: set[str] = set()
     for match in re.finditer(r"\bfor\s+([A-Za-z_][A-Za-z0-9_]*)\s+in\s+(.+?)\s*;?\s*do\b(.+?)(?:\bdone\b|$)", command, re.DOTALL):
         variable, items, body = match.groups()
         if f"${variable}" not in body:
             continue
-        names.update(PP_CLI_RE.findall(items))
+        names.update(TRACKED_CLI_RE.findall(items))
     return names
 
 
 def is_failure_text(text: str, command: str = "", clis: Optional[List[str]] = None) -> bool:
     if not text:
         return False
-    pp_names = pp_cli_names(command) if clis is None else clis
+    tracked_names = tracked_cli_names(command) if clis is None else clis
     if BAD_EXIT_RE.search(text):
         return True
     if GOOD_EXIT_RE.search(text):
         return False
-    if pp_names:
+    if tracked_names:
         # Tracked CLI failures need an explicit status signal. Text-only
         # friction is too ambiguous: help, doctor, inventory, truncated output,
         # and deliberate auth/404 probes all contain error-shaped language.
@@ -1130,7 +1051,7 @@ def silent_empty_evidence(
 def record_silent_empty(summary: SessionSummary, ev: Evidence, call: ToolCall) -> None:
     summary.silent_empty.append(ev)
     for cli in call.clis:
-        add_pp_cli_evidence(summary, cli, ev)
+        add_tracked_cli_evidence(summary, cli, ev)
 
 
 def empty_result_was_swallowed(
@@ -1149,13 +1070,13 @@ def empty_result_was_swallowed(
     )
 
 
-def pp_cli_failures_for_output(
+def tracked_cli_failures_for_output(
     command: str,
     output: str,
     clis: Optional[List[str]] = None,
     confirmed_failure: bool = False,
 ) -> List[str]:
-    clis = pp_cli_names(command) if clis is None else clis
+    clis = tracked_cli_names(command) if clis is None else clis
     if not clis or (not confirmed_failure and not is_failure_text(output, command, clis)):
         return []
     if len(clis) == 1:
@@ -1168,7 +1089,7 @@ def pp_cli_failures_for_output(
             if cli not in line:
                 continue
             window = "\n".join(lines[max(0, index - 1) : index + 3])
-            if BAD_EXIT_RE.search(window) or PP_FRICTION_RE.search(window):
+            if BAD_EXIT_RE.search(window) or TRACKED_CLI_FRICTION_RE.search(window):
                 localized.add(cli)
     return sorted(localized)
 
@@ -1206,17 +1127,6 @@ def parse_claude_session(path: Path) -> SessionSummary:
         if role == "user":
             text = text_from_claude_content(content)
             if text:
-                for command in SLASH_COMMAND_RE.findall(text):
-                    ev = evidence(
-                        source="claude",
-                        path=path,
-                        line=line_no,
-                        kind="slash_command",
-                        text=f"/{command}",
-                        session_id=summary.session_id,
-                        occurred_at=ts,
-                    )
-                    summary.slash_commands.setdefault(command, []).append(ev)
                 if (
                     agent_has_responded
                     and seen_user_texts
@@ -1253,7 +1163,7 @@ def parse_claude_session(path: Path) -> SessionSummary:
                         line=line_no,
                         command=command,
                         skill=skill,
-                        clis=pp_cli_names(command) if name == "Bash" else [],
+                        clis=tracked_cli_names(command) if name == "Bash" else [],
                         occurred_at=(isoformat_utc(parsed) if (parsed := parse_time(ts)) else ""),
                     )
                     calls[call_id] = call
@@ -1273,14 +1183,14 @@ def parse_claude_session(path: Path) -> SessionSummary:
                         )
                     if name == "Bash" and command:
                         for cli in call.clis:
-                            add_pp_cli_evidence(
+                            add_tracked_cli_evidence(
                                 summary,
                                 cli,
                                 evidence(
                                     source="claude",
                                     path=path,
                                     line=line_no,
-                                    kind="pp_cli_invocation",
+                                    kind="tracked_cli_invocation",
                                     text=command,
                                     session_id=summary.session_id,
                                     tool_name=name,
@@ -1315,16 +1225,16 @@ def parse_claude_session(path: Path) -> SessionSummary:
                         )
                         summary.failures.append(ev)
                         if call.name == "Bash":
-                            clis = pp_cli_failures_for_output(
+                            clis = tracked_cli_failures_for_output(
                                 call.command,
                                 result_text,
                                 call.clis,
                                 confirmed_failure=True,
                             )
                             for cli in clis or call.clis:
-                                add_pp_cli_evidence(summary, cli, ev)
+                                add_tracked_cli_evidence(summary, cli, ev)
                     elif call and result_text and call.name == "Bash":
-                        capture_pp_cli_hang(
+                        capture_tracked_cli_hang(
                             summary,
                             "claude",
                             path,
@@ -1426,25 +1336,14 @@ def parse_codex_session(path: Path) -> SessionSummary:
 
         text = codex_message_text(payload)
         # Codex stores developer, user, and assistant messages in the same
-        # response_item/message shape. Only user-role messages can carry slash
-        # commands or user corrections; accepting every role turns runtime
-        # instructions and assistant prose into false correction evidence.
+        # response_item/message shape. Only user-role messages can carry user
+        # corrections; accepting every role turns runtime instructions and
+        # assistant prose into false correction evidence.
         # Older fixtures may omit role, so preserve that legacy user shape.
         is_user_text = payload.get("type") == "user_message" or (
             payload.get("type") == "message" and payload.get("role") in {None, "user"}
         )
         if text and is_user_text:
-            for command in SLASH_COMMAND_RE.findall(text):
-                ev = evidence(
-                    source="codex",
-                    path=path,
-                    line=line_no,
-                    kind="slash_command",
-                    text=f"/{command}",
-                    session_id=summary.session_id,
-                    occurred_at=ts,
-                )
-                summary.slash_commands.setdefault(command, []).append(ev)
             if (
                 agent_has_responded
                 and seen_user_texts
@@ -1487,15 +1386,15 @@ def parse_codex_session(path: Path) -> SessionSummary:
                 # shell commands embedded as string literals.
                 command = str(payload.get("input") or "")
                 if CODE_COMMAND_RE.match(command):
-                    clis = pp_cli_names_from_code(command)
+                    clis = tracked_cli_names_from_code(command)
                 else:
                     clis = sorted(
-                        set(pp_cli_names(command)) | set(pp_cli_names_from_code(command))
+                        set(tracked_cli_names(command)) | set(tracked_cli_names_from_code(command))
                     )
             else:
                 args = parse_json_maybe(payload.get("arguments"))
                 command = str(args.get("cmd") or args.get("command") or "")
-                clis = pp_cli_names(command)
+                clis = tracked_cli_names(command)
             call = ToolCall(
                 call_id=call_id,
                 name=name,
@@ -1508,14 +1407,14 @@ def parse_codex_session(path: Path) -> SessionSummary:
             summary.tool_calls.append(call)
             if command:
                 for cli in clis:
-                    add_pp_cli_evidence(
+                    add_tracked_cli_evidence(
                         summary,
                         cli,
                         evidence(
                             source="codex",
                             path=path,
                             line=line_no,
-                            kind="pp_cli_invocation",
+                            kind="tracked_cli_invocation",
                             text=command,
                             session_id=summary.session_id,
                             tool_name=name,
@@ -1542,12 +1441,12 @@ def parse_codex_session(path: Path) -> SessionSummary:
                     occurred_at=ts,
                 )
                 summary.failures.append(ev)
-                for cli in pp_cli_failures_for_output(
+                for cli in tracked_cli_failures_for_output(
                     call.command, output, call.clis, confirmed_failure=True
                 ):
-                    add_pp_cli_evidence(summary, cli, ev)
+                    add_tracked_cli_evidence(summary, cli, ev)
             elif call and output:
-                capture_pp_cli_hang(
+                capture_tracked_cli_hang(
                     summary, "codex", path, line_no, call.command, output, call.clis, ts
                 )
 
@@ -1561,6 +1460,234 @@ def parse_codex_session(path: Path) -> SessionSummary:
         if ev:
             record_silent_empty(summary, ev, call)
     return summary
+
+
+def command_from_tool_payload(tool_name: str, payload: Any) -> str:
+    data = parse_json_maybe(payload)
+    if not data:
+        return ""
+    return str(data.get("command") or data.get("cmd") or "")
+
+
+def parse_hermes_messages(
+    *,
+    source: str,
+    path: Path,
+    profile: str,
+    session_id: str,
+    rows: Iterable[Tuple[int, str, str, str, str, Any]],
+    cwd: str = "",
+) -> SessionSummary:
+    """Normalize one Hermes SQLite session without treating prompts as corrections."""
+    summary = SessionSummary(source=source, path=path, session_id=session_id, cwd=cwd)
+    calls: Dict[str, ToolCall] = {}
+    seen_user_texts: set[str] = set()
+    agent_has_responded = False
+
+    for line_no, role, content, tool_calls_raw, tool_call_id, timestamp in rows:
+        parsed_time = parse_time(timestamp)
+        if parsed_time:
+            iso = isoformat_utc(parsed_time)
+            summary.started_at = summary.started_at or iso
+            summary.ended_at = iso
+        content = content or ""
+
+        if role in {"assistant", "tool"}:
+            agent_has_responded = True
+        if role == "user" and content:
+            if (
+                agent_has_responded
+                and seen_user_texts
+                and content not in seen_user_texts
+                and is_user_correction_text(content, path)
+            ):
+                summary.corrections.append(
+                    evidence(
+                        source=source,
+                        path=path,
+                        line=line_no,
+                        kind="user_correction",
+                        text=content,
+                        session_id=session_id,
+                        occurred_at=timestamp,
+                    )
+                )
+            if not is_transcript_scaffold(content, path):
+                seen_user_texts.add(content)
+
+        if tool_calls_raw:
+            try:
+                parsed_calls = json.loads(tool_calls_raw)
+            except (json.JSONDecodeError, TypeError):
+                parsed_calls = []
+            if isinstance(parsed_calls, dict):
+                parsed_calls = [parsed_calls]
+            if isinstance(parsed_calls, list):
+                for index, item in enumerate(parsed_calls):
+                    if not isinstance(item, dict):
+                        continue
+                    fn_obj = item.get("function") if isinstance(item.get("function"), dict) else item
+                    fn = fn_obj if isinstance(fn_obj, dict) else {}
+                    name = str(fn.get("name") or item.get("name") or "")
+                    call_id = str(
+                        item.get("id")
+                        or item.get("call_id")
+                        or f"{session_id}:{line_no}:{index}"
+                    )
+                    arguments = fn.get("arguments") or item.get("arguments") or {}
+                    command = command_from_tool_payload(name, arguments)
+                    parsed_arguments = parse_json_maybe(arguments)
+                    skill = (
+                        str(parsed_arguments.get("skill") or parsed_arguments.get("name") or "")
+                        if name in {"skill_view", "skill_manage", "Skill"}
+                        else ""
+                    )
+                    clis = tracked_cli_names(command)
+                    call = ToolCall(
+                        call_id=call_id,
+                        name=name,
+                        line=line_no,
+                        command=command,
+                        skill=skill,
+                        clis=clis,
+                        occurred_at=(isoformat_utc(parsed_time) if parsed_time else ""),
+                    )
+                    calls[call_id] = call
+                    summary.tool_calls.append(call)
+                    if skill:
+                        summary.skill_invocations.setdefault(skill, []).append(
+                            evidence(
+                                source=source,
+                                path=path,
+                                line=line_no,
+                                kind="skill_invocation",
+                                text=f"{name}({skill})",
+                                session_id=session_id,
+                                tool_name=name,
+                                occurred_at=timestamp,
+                            )
+                        )
+                    for cli in clis:
+                        add_tracked_cli_evidence(
+                            summary,
+                            cli,
+                            evidence(
+                                source=source,
+                                path=path,
+                                line=line_no,
+                                kind="tracked_cli_invocation",
+                                text=command,
+                                session_id=session_id,
+                                tool_name=name,
+                                command=command,
+                                occurred_at=timestamp,
+                            ),
+                        )
+
+        if role == "tool" and content:
+            call = calls.get(str(tool_call_id or ""))
+            if call and tool_result_is_failure(call, content, None):
+                ev = evidence(
+                    source=source,
+                    path=path,
+                    line=line_no,
+                    kind="tool_failure",
+                    text=content,
+                    session_id=session_id,
+                    tool_name=call.name,
+                    command=call.command,
+                    occurred_at=timestamp,
+                )
+                summary.failures.append(ev)
+                for cli in tracked_cli_failures_for_output(
+                    call.command,
+                    content,
+                    call.clis,
+                    confirmed_failure=True,
+                ):
+                    add_tracked_cli_evidence(summary, cli, ev)
+            elif call:
+                capture_tracked_cli_hang(
+                    summary,
+                    source,
+                    path,
+                    line_no,
+                    call.command,
+                    content,
+                    call.clis,
+                    timestamp,
+                )
+
+    if profile:
+        summary.cwd = summary.cwd or f"profile:{profile}"
+    return summary
+
+
+def hermes_profile_name(db_path: Path, home: Path) -> str:
+    try:
+        relative = db_path.relative_to(home / ".hermes" / "profiles")
+        return relative.parts[0]
+    except ValueError:
+        return "default"
+
+
+def discover_hermes_profile_dbs(home: Path) -> List[Path]:
+    dbs: List[Path] = []
+    default_db = home / ".hermes" / "state.db"
+    if default_db.exists():
+        dbs.append(default_db)
+    profiles_root = home / ".hermes" / "profiles"
+    if profiles_root.exists():
+        for profile_dir in sorted(item for item in profiles_root.iterdir() if item.is_dir()):
+            db_path = profile_dir / "state.db"
+            if db_path.exists():
+                dbs.append(db_path)
+    return dbs
+
+
+def parse_hermes_profile_db(
+    db_path: Path,
+    *,
+    home: Optional[Path] = None,
+    since: Optional[dt.datetime] = None,
+    max_sessions: int = 0,
+) -> List[SessionSummary]:
+    home = home or Path.home()
+    profile = hermes_profile_name(db_path, home)
+    connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        since_timestamp = since.timestamp() if since else 0
+        session_rows = connection.execute(
+            "select id, coalesce(cwd,''), started_at, "
+            "coalesce(ended_at, started_at), source from sessions "
+            "where coalesce(ended_at, started_at) >= ? "
+            "order by coalesce(ended_at, started_at)",
+            (since_timestamp,),
+        ).fetchall()
+        if max_sessions:
+            session_rows = session_rows[-max_sessions:]
+        summaries: List[SessionSummary] = []
+        for session_id, cwd, _started, _ended, _session_source in session_rows:
+            rows = connection.execute(
+                "select id, role, coalesce(content,''), coalesce(tool_calls,''), "
+                "coalesce(tool_call_id,''), timestamp from messages "
+                "where session_id=? and active=1 order by id",
+                (session_id,),
+            ).fetchall()
+            summary = parse_hermes_messages(
+                source="hermes_profile_log",
+                path=db_path,
+                profile=profile,
+                session_id=str(session_id),
+                rows=rows,
+                cwd=str(cwd or f"profile:{profile}"),
+            )
+            if summary.has_signal():
+                summaries.append(summary)
+        return summaries
+    finally:
+        connection.close()
+
 
 
 def discover_claude_sessions(home: Path) -> List[Path]:
@@ -1612,7 +1739,7 @@ def proposal_key(route: str, target_kind: str, target_name: str, evidence_items:
     h.update(target_name.encode())
     for ev in evidence_items:
         h.update(b"\0")
-        h.update(f"{ev.source}:{ev.path}:{ev.line}:{ev.kind}".encode())
+        h.update(f"{ev.machine}:{ev.source}:{ev.path}:{ev.line}:{ev.kind}".encode())
     return h.hexdigest()[:20]
 
 
@@ -1630,6 +1757,7 @@ def make_proposal(
     key = proposal_key(route, target_kind, target_name, evidence_items)
     created_at = utc_now()
     latest = latest_evidence_time(evidence_items)
+    machines = sorted({ev.machine for ev in evidence_items if ev.machine})
     return {
         "schema_version": SCHEMA_VERSION,
         "proposal_id": f"imp-{key}",
@@ -1642,6 +1770,7 @@ def make_proposal(
         "summary": summary,
         "impact": impact,
         "target": {"kind": target_kind, "name": target_name},
+        "machines": machines,
         "evidence": [ev.as_dict() for ev in evidence_items[:12]],
         "suggested_action": suggested_action,
         "apply_policy": {
@@ -1651,529 +1780,33 @@ def make_proposal(
     }
 
 
-def content_proposal_key(title: str, evidence_items: List[Evidence]) -> str:
-    h = hashlib.sha256()
-    h.update(b"content_idea\0")
-    h.update(title.encode())
-    for ev in evidence_items:
-        h.update(b"\0")
-        h.update(f"{ev.source}:{ev.path}:{ev.line}:{ev.kind}".encode())
-    return h.hexdigest()[:20]
 
 
-def privacy_for_content(evidence_items: List[Evidence]) -> Dict[str, Any]:
-    joined = "\n".join(
-        " ".join([ev.excerpt or "", ev.command or ""]) for ev in evidence_items
-    )
-    is_private = bool(PRIVATE_CONTENT_RE.search(joined))
-    must_anonymize = [
-        "names",
-        "emails",
-        "phone numbers",
-        "auth tokens",
-        "client/customer details",
-    ]
-    blocked = ["raw secrets", "private client data", "family or health details"]
-    if is_private:
-        must_anonymize.extend(["raw message contents", "contact names", "thread excerpts"])
-        blocked.extend(["raw messages", "contact lists"])
-    return {
-        "risk_level": "high" if is_private else "low",
-        "must_anonymize": must_anonymize,
-        "safe_public_abstraction": (
-            "Teach the reusable workflow with synthetic examples; keep private names, "
-            "messages, clients, family details, auth material, and exact sensitive data out."
-        ),
-        "blocked_details": blocked,
-    }
-
-
-def content_evidence_dicts(evidence_items: List[Evidence], privacy: Dict[str, Any]) -> List[Dict[str, Any]]:
-    if privacy.get("risk_level") == "high":
-        return [
-            {
-                "source": ev.source,
-                "path": ev.path,
-                "line": ev.line,
-                "session_id": ev.session_id,
-                "kind": ev.kind,
-                "tool_name": ev.tool_name,
-                "command": "<private workflow evidence redacted>",
-                "occurred_at": ev.occurred_at,
-                "excerpt": "<private workflow evidence redacted>",
-            }
-            for ev in evidence_items[:12]
-        ]
-    return [ev.as_dict() for ev in evidence_items[:12]]
-
-
-def make_content_proposal(
-    *,
-    title: str,
-    content_type: str,
-    evidence_items: List[Evidence],
-    trigger_kind: str,
-    real_workflow_or_moment: str,
-    audience: List[str],
-    why_interesting: List[str],
-    suggested_search_query: str,
-    rough_outline: List[str],
-    confidence: float,
-    recommendation: str,
-) -> Dict[str, Any]:
-    key = content_proposal_key(title, evidence_items)
-    privacy = privacy_for_content(evidence_items)
-    created_at = utc_now()
-    latest = latest_evidence_time(evidence_items)
-    if privacy["risk_level"] == "high" and recommendation == "write_now":
-        recommendation = "needs_context"
-        confidence = min(confidence, 0.72)
-    return {
-        "schema_version": SCHEMA_VERSION,
-        "proposal_id": f"content-{key}",
-        "proposal_key": key,
-        "created_at": created_at,
-        "latest_evidence_at": isoformat_utc(latest) if latest else created_at,
-        "status": "proposed",
-        "route": "content_idea",
-        "title": title,
-        "content_type": content_type,
-        "recommendation": recommendation,
-        "confidence": round(confidence, 2),
-        "summary": real_workflow_or_moment,
-        "target": {"kind": "content_angle", "name": title},
-        "trigger": {
-            "kind": trigger_kind,
-            "real_workflow_or_moment": real_workflow_or_moment,
-        },
-        "audience": audience,
-        "why_interesting": why_interesting,
-        "reader_usefulness": [
-            "Grounded in actual sessions rather than generic brainstorming.",
-            "Can be turned into a tutorial, case study, or behind-the-scenes post after review.",
-        ],
-        "timeliness": {
-            "why_now": "Agent workflows, local AI memory, and coding-agent operations are active public conversations.",
-            "last30days_recommended": True,
-        },
-        "last30days": {
-            "should_run": True,
-            "suggested_search_query": suggested_search_query,
-            "purpose": "Validate public language, objections, adjacent examples, and current demand before drafting.",
-        },
-        "rough_outline": rough_outline,
-        "privacy": {**privacy, "content_notice": CONTENT_PRIVACY_NOTICE},
-        "suggested_action": (
-            "Review the angle, privacy notes, and evidence references. If approved, "
-            "optionally run the suggested last30days query, then brief a writer. Do not auto-draft."
-        ),
-        "evidence": content_evidence_dicts(evidence_items, privacy),
-        "review": {
-            "needed_from_cat": [
-                "Approve, reject, or reframe the angle.",
-                "Confirm what details must stay private or be anonymized.",
-                "Decide whether to run last30days before briefing a writer.",
-            ],
-            "next_action": "Stage for editorial review; do not draft or publish automatically.",
-        },
-        "apply_policy": {
-            "mode": "manual_review_required",
-            "notes": "This route stages content ideas only. Review before research, drafting, posting, or publishing.",
-        },
-    }
-
-
-def workflow_evidence_from_tool_call(session: SessionSummary, call: ToolCall) -> Evidence:
-    return Evidence(
-        source=session.source,
-        path=str(session.path),
-        line=call.line,
-        kind="workflow_signal",
-        excerpt=call.command,
-        session_id=session.session_id,
-        tool_name=call.name,
-        command=call.command,
-        occurred_at=call.occurred_at,
-    )
-
-
-def generate_workflow_content_proposals(sessions: List[SessionSummary]) -> List[Dict[str, Any]]:
-    proposals: List[Dict[str, Any]] = []
-    for pattern in CONTENT_WORKFLOW_PATTERNS:
-        evidence_items: List[Evidence] = []
-        regex = pattern["regex"]
-        for session in sessions:
-            for call in session.tool_calls:
-                if call.command and regex.search(call.command):
-                    evidence_items.append(workflow_evidence_from_tool_call(session, call))
-        min_signals = int(pattern.get("min_signals", 2))
-        if len(evidence_items) < min_signals:
-            continue
-        session_count = len({ev.session_id for ev in evidence_items})
-        recommendation = str(pattern.get("recommendation", "save_for_later"))
-        proposals.append(
-            make_content_proposal(
-                title=str(pattern["title"]),
-                content_type=str(pattern.get("content_type", "case_study")),
-                evidence_items=evidence_items,
-                trigger_kind="workflow_command_cluster",
-                real_workflow_or_moment=(
-                    f"Matched {len(evidence_items)} command-level workflow signal(s) "
-                    f"across {session_count} session(s), suggesting a repeatable operating loop."
-                ),
-                audience=list(pattern.get("audience", ["agent builders", "operators"])),
-                why_interesting=list(pattern.get("why", ["Grounded in repeated real-session commands."])),
-                suggested_search_query=str(pattern.get("query", "AI agent workflow operations")),
-                rough_outline=list(pattern.get("outline", ["The workflow", "The implementation", "What readers can copy"])),
-                confidence=float(pattern.get("confidence", 0.7)),
-                recommendation=recommendation,
-            )
-        )
-    return proposals
-
-
-def is_content_cli_name(executable: str) -> bool:
-    if not executable or executable in CONTENT_CLI_IGNORE or executable.startswith("-"):
-        return False
-    return bool(re.match(r"^[A-Za-z][A-Za-z0-9._-]*$", executable))
-
-
-def content_count_summary(items: List[Tuple[str, int]], prefix: str = "") -> str:
-    return ", ".join(f"{prefix}{name} ({count})" for name, count in items)
-
-
-def top_evidence(items_by_name: Dict[str, List[Evidence]], ranked: List[Tuple[str, int]], limit: int = 12) -> List[Evidence]:
-    evidence_items: List[Evidence] = []
-    for name, _count in ranked:
-        evidence_items.extend(items_by_name.get(name, [])[:2])
-        if len(evidence_items) >= limit:
-            break
-    return evidence_items[:limit]
-
-
-def generate_aggregate_content_proposals(
-    sessions: List[SessionSummary], workflow_proposals: List[Dict[str, Any]]
-) -> List[Dict[str, Any]]:
+def generate_proposals(sessions: List[SessionSummary]) -> List[Dict[str, Any]]:
     proposals: List[Dict[str, Any]] = []
 
-    skill_items: Dict[str, List[Evidence]] = {}
-    slash_items: Dict[str, List[Evidence]] = {}
-    cli_items: Dict[str, List[Evidence]] = {}
-    for session in sessions:
-        for name, items in session.skill_invocations.items():
-            skill_items.setdefault(name, []).extend(items)
-        for name, items in session.slash_commands.items():
-            if name and name[0].islower():
-                slash_items.setdefault(name, []).extend(items)
-        for call in session.tool_calls:
-            executable = first_executable(call.command or "")
-            if not is_content_cli_name(executable):
-                continue
-            cli_items.setdefault(executable, []).append(workflow_evidence_from_tool_call(session, call))
-
-    top_skills = Counter({name: len(items) for name, items in skill_items.items()}).most_common(10)
-    if len(top_skills) >= 3:
-        proposals.append(
-            make_content_proposal(
-                title="My top 10 skills for running agents like an operating system",
-                content_type="listicle",
-                evidence_items=top_evidence(skill_items, top_skills),
-                trigger_kind="aggregate_skill_usage",
-                real_workflow_or_moment=(
-                    "Most-used skills across scanned sessions: " + content_count_summary(top_skills[:10])
-                ),
-                audience=["agent builders", "founders", "AI operators"],
-                why_interesting=[
-                    "It turns actual usage data into a practical stack, not a generic tools list.",
-                    "Readers can copy the categories: research, task ledger, QA, publishing, and review.",
-                ],
-                suggested_search_query="best Claude Code skills agent workflows tools operators",
-                rough_outline=[
-                    "The scoring rule: skills I actually use repeatedly",
-                    "Top 10 skills and what each one does in the loop",
-                    "Which skills are for quality, which are for leverage, which are for safety",
-                    "What I would install first if starting from zero",
-                    "What the list says about where agent work is going",
-                ],
-                confidence=0.8,
-                recommendation="write_now",
-            )
-        )
-
-    top_slashes = Counter({name: len(items) for name, items in slash_items.items()}).most_common(10)
-    if len(top_slashes) >= 3:
-        proposals.append(
-            make_content_proposal(
-                title="My most-used slash commands for agent work",
-                content_type="listicle",
-                evidence_items=top_evidence(slash_items, top_slashes),
-                trigger_kind="aggregate_slash_command_usage",
-                real_workflow_or_moment=(
-                    "Most-used slash commands across scanned sessions: "
-                    + content_count_summary(top_slashes[:10], prefix="/")
-                ),
-                audience=["Claude Code users", "Codex users", "agent operators"],
-                why_interesting=[
-                    "Slash commands are visible, copyable control surfaces for repeatable agent work.",
-                    "A frequency-ranked list is more credible than a generic command catalog.",
-                ],
-                suggested_search_query="Claude Code slash commands agent workflow examples",
-                rough_outline=[
-                    "Why slash commands beat repeating prompts",
-                    "The commands I use most and what each one gates",
-                    "When a command should exist vs. a one-off prompt",
-                    "How to design commands around review, QA, and safety",
-                    "A starter command set readers can copy",
-                ],
-                confidence=0.78,
-                recommendation="write_now",
-            )
-        )
-
-    top_clis = Counter({name: len(items) for name, items in cli_items.items()}).most_common(10)
-    if len(top_clis) >= 3:
-        proposals.append(
-            make_content_proposal(
-                title="The command-line stack I actually use to run agent workflows",
-                content_type="listicle",
-                evidence_items=top_evidence(cli_items, top_clis),
-                trigger_kind="aggregate_cli_usage",
-                real_workflow_or_moment=(
-                    "Most-used command-line tools across scanned sessions: "
-                    + content_count_summary(top_clis[:10])
-                ),
-                audience=["agent builders", "technical founders", "operators"],
-                why_interesting=[
-                    "It shows the boring plumbing behind useful agent work: CLIs, APIs, and local scripts.",
-                    "A usage-ranked stack is more credible than a wishlist of trendy tools.",
-                ],
-                suggested_search_query="AI agent workflows command line tools CLI automation stack",
-                rough_outline=[
-                    "Why my agents spend so much time in the command line",
-                    "The top tools by real usage and what each one unlocks",
-                    "Which tools are public-safe and which need synthetic examples",
-                    "How I decide when to make a CLI vs. a skill vs. a slash command",
-                    "A starter stack for readers who want agent workflows that leave chat",
-                ],
-                confidence=0.78,
-                recommendation="write_now",
-            )
-        )
-
-    if len(workflow_proposals) >= 2:
-        labels = []
-        evidence_items: List[Evidence] = []
-        for proposal in workflow_proposals:
-            title = proposal.get("title", "")
-            if "task ledger" in title:
-                labels.append("task-ledger")
-            elif "executive assistant" in title:
-                labels.append("executive-assistant")
-            elif "revenue watch" in title:
-                labels.append("revenue-watch")
-            else:
-                labels.append(str(title))
-            for ev in proposal.get("evidence", [])[:3]:
-                evidence_items.append(
-                    Evidence(
-                        source=str(ev.get("source", "")),
-                        path=str(ev.get("path", "")),
-                        line=int(ev.get("line", 0) or 0),
-                        kind=str(ev.get("kind", "workflow_signal")),
-                        excerpt=str(ev.get("excerpt", "")),
-                        session_id=str(ev.get("session_id", "")),
-                        tool_name=str(ev.get("tool_name", "")),
-                        command=str(ev.get("command", "")),
-                    )
-                )
-        labels = list(dict.fromkeys(labels))
-        proposals.append(
-            make_content_proposal(
-                title="Loop examples: the agent workflows I keep reusing",
-                content_type="roundup",
-                evidence_items=evidence_items[:12],
-                trigger_kind="aggregate_loop_examples",
-                real_workflow_or_moment=(
-                    "Reusable loops surfaced from real sessions: " + ", ".join(labels[:8])
-                ),
-                audience=["agent builders", "operators", "technical founders"],
-                why_interesting=[
-                    "The strongest story is not one workflow; it is the pattern across workflows.",
-                    "Loop examples make the abstract advice concrete and show what agents can own repeatedly.",
-                ],
-                suggested_search_query="AI agent workflow loops examples recurring automation operators",
-                rough_outline=[
-                    "What makes something a loop instead of a prompt",
-                    "Loop 1: task ledger / agent work tracking",
-                    "Loop 2: executive assistant triage",
-                    "Loop 3: revenue watch / dashboard replacement",
-                    "How to choose which loop to build next",
-                ],
-                confidence=0.82,
-                recommendation="write_now",
-            )
-        )
-
-    return proposals
-
-
-def generate_content_proposals(sessions: List[SessionSummary]) -> List[Dict[str, Any]]:
-    proposals: List[Dict[str, Any]] = []
-
-    slash_by_name: Dict[str, List[Evidence]] = {}
-    for session in sessions:
-        for name, items in session.slash_commands.items():
-            slash_by_name.setdefault(name, []).extend(items)
-    for name, evidence_items in sorted(slash_by_name.items()):
-        sessions_seen = {ev.session_id for ev in evidence_items}
-        profile = CONTENT_SLASH_COMMANDS.get(name)
-        if not profile and len(sessions_seen) < 2:
-            continue
-        command_label = f"/{name}"
-        title = str(profile.get("title")) if profile else f"How I use {command_label} in real agent workflows"
-        proposals.append(
-            make_content_proposal(
-                title=title,
-                content_type=profile.get("content_type", "blog_post") if profile else "blog_post",
-                evidence_items=evidence_items,
-                trigger_kind="slash_command_usage",
-                real_workflow_or_moment=(
-                    f"{command_label} appeared in {len(evidence_items)} transcript signal(s) "
-                    f"across {len(sessions_seen)} session(s), suggesting a repeatable agent workflow."
-                ),
-                audience=profile.get("audience", ["agent builders", "operators"]) if profile else ["agent builders", "operators"],
-                why_interesting=[
-                    "Slash commands are a concrete control surface for agents, not vague prompting advice.",
-                    "Repeated use means this is likely part of a real operating system.",
-                ],
-                suggested_search_query=profile.get("query", f"{command_label} agent workflows slash commands") if profile else f"{command_label} agent workflows slash commands",
-                rough_outline=[
-                    f"The problem {command_label} solves",
-                    "The workflow before the command existed",
-                    "How I use it in real sessions",
-                    "What readers can copy without copying private details",
-                    "Where the loop still needs human judgment",
-                ],
-                confidence=0.82 if len(sessions_seen) >= 2 else 0.72,
-                recommendation="write_now" if len(sessions_seen) >= 2 or profile else "save_for_later",
-            )
-        )
-
-    private_build_evidence: List[Evidence] = []
-    for session in sessions:
-        for ev in session.failures:
-            text = f"{ev.excerpt} {ev.command}"
-            if PRIVATE_CONTENT_RE.search(text) and BUILD_CONTENT_RE.search(text):
-                private_build_evidence.append(ev)
-    if private_build_evidence:
-        proposals.append(
-            make_content_proposal(
-                title="How I built a personal CRM from my text messages",
-                content_type="case_study",
-                evidence_items=private_build_evidence,
-                trigger_kind="built_from_scratch_private_workflow",
-                real_workflow_or_moment=(
-                    "Session evidence points to a private communication/search workflow: "
-                    "turning messages or contact context into a searchable operational system."
-                ),
-                audience=["founders", "operators", "agent builders", "local-first AI users"],
-                why_interesting=[
-                    "It has a clear before/after: messy private threads become searchable context.",
-                    "It shows agents doing useful glue work around real life, not demo prompts.",
-                    "It is publishable only as an anonymized architecture/workflow story.",
-                ],
-                suggested_search_query="personal CRM text messages AI memory iMessage search local-first agents",
-                rough_outline=[
-                    "The problem: useful commitments and context live in text threads",
-                    "Why normal contact apps and inbox search are not enough",
-                    "The local indexing/search architecture",
-                    "Where agents help extract follow-up context",
-                    "Privacy boundaries and synthetic examples",
-                    "What to build next",
-                ],
-                confidence=0.72,
-                recommendation="needs_context",
-            )
-        )
-
-    workflow_proposals = generate_workflow_content_proposals(sessions)
-    aggregate_proposals = generate_aggregate_content_proposals(sessions, workflow_proposals)
-    return dedupe_proposals(proposals + workflow_proposals + aggregate_proposals)
-
-
-def printing_press_source(cli: str, pp_root: Optional[Path]) -> Optional[Path]:
-    """Resolve a ``*-pp-cli`` name to its source directory in the printing-press tree.
-
-    Returns the first existing directory among ``<root>/library/<name>``,
-    ``<root>/manuscripts/<name>``, and ``<root>/<name>``, or ``None`` when no root
-    is configured, the name is not a pp-cli, or nothing matches on disk. Resolving
-    on disk keeps the default safe: on a machine with no printing-press tree the
-    proposal simply omits the source line instead of inventing a path.
-    """
-    if not pp_root or not cli.endswith(TRACKED_CLI_SUFFIX):
-        return None
-    name = cli[: -len(TRACKED_CLI_SUFFIX)]
-    for candidate in (pp_root / "library" / name, pp_root / "manuscripts" / name, pp_root / name):
-        try:
-            if candidate.is_dir():
-                return candidate
-        except OSError:
-            continue
-    return None
-
-
-def pp_cli_candidate_is_valid(
-    cli: str, pp_root: Optional[Path], plain_command_clis: set[str]
-) -> bool:
-    """Conservatively reject unresolved names seen only in code literals."""
-    if not VALIDATE_PP_CLI_CANDIDATES or cli in plain_command_clis:
-        return True
-    # A missing/unavailable source checkout cannot disprove the candidate.
-    try:
-        if not pp_root or not pp_root.is_dir():
-            return True
-    except OSError:
-        return True
-    return printing_press_source(cli, pp_root) is not None
-
-
-def generate_proposals(
-    sessions: List[SessionSummary], pp_root: Optional[Path] = None, route: str = "improvement"
-) -> List[Dict[str, Any]]:
-    proposals: List[Dict[str, Any]] = []
-
-    include_improvement = route in {"all", "improvement"}
-    include_content = route in {"all", "content_idea"}
-
-    if not include_improvement and include_content:
-        return generate_content_proposals(sessions)
-
-    pp_invocations: Dict[str, List[Evidence]] = {}
-    pp_failures: Dict[str, List[Evidence]] = {}
-    pp_hangs: Dict[str, List[Evidence]] = {}
-    pp_silent_empty: Dict[str, List[Evidence]] = {}
-    pp_max_retries: Dict[str, int] = {}
-    plain_command_clis: set[str] = set()
+    tracked_invocations: Dict[str, List[Evidence]] = {}
+    tracked_failures: Dict[str, List[Evidence]] = {}
+    tracked_hangs: Dict[str, List[Evidence]] = {}
+    tracked_silent_empty: Dict[str, List[Evidence]] = {}
+    tracked_max_retries: Dict[str, int] = {}
     for session in sessions:
         include_session_silent_empty = (
             INCLUDE_SUBAGENT_FAILURES or "/subagents/" not in str(session.path)
         )
-        for call in session.tool_calls:
-            if call.command and not CODE_COMMAND_RE.match(call.command):
-                plain_command_clis.update(pp_cli_names(call.command))
-        for cli, items in session.pp_cli_invocations.items():
-            invocations = [item for item in items if item.kind == "pp_cli_invocation"]
-            pp_invocations.setdefault(cli, []).extend(invocations)
+        for cli, items in session.tracked_cli_invocations.items():
+            invocations = [item for item in items if item.kind == "tracked_cli_invocation"]
+            tracked_invocations.setdefault(cli, []).extend(invocations)
             for item in items:
                 # Classify strictly by the kind assigned at parse time. Regexing
                 # the excerpt here would re-scan invocation excerpts, which are
-                # command text: `timeout 120 foo-pp-cli ...` is not a hang.
+                # command text: `timeout 120 foo-cli ...` is not a hang.
                 if item.kind == "tool_failure":
-                    pp_failures.setdefault(cli, []).append(item)
-                elif item.kind == "pp_cli_hang":
-                    pp_hangs.setdefault(cli, []).append(item)
+                    tracked_failures.setdefault(cli, []).append(item)
+                elif item.kind == "tracked_cli_hang":
+                    tracked_hangs.setdefault(cli, []).append(item)
                 elif item.kind == "silent_empty" and include_session_silent_empty:
-                    pp_silent_empty.setdefault(cli, []).append(item)
+                    tracked_silent_empty.setdefault(cli, []).append(item)
 
             # Retry-before-success is per CLI and session. Repetition alone is
             # normal use; qualify it only when the same session has failure/hang
@@ -2182,7 +1815,7 @@ def generate_proposals(
             signal_sessions = {
                 item.session_id
                 for item in items
-                if item.kind in {"tool_failure", "pp_cli_hang"}
+                if item.kind in {"tool_failure", "tracked_cli_hang"}
                 or (item.kind == "silent_empty" and include_session_silent_empty)
             }
             for item in invocations:
@@ -2194,25 +1827,30 @@ def generate_proposals(
                 if session_id in signal_sessions or has_retry_shape_variation(
                     session_invocations, cli
                 ):
-                    pp_max_retries[cli] = max(pp_max_retries.get(cli, 0), count)
+                    tracked_max_retries[cli] = max(
+                        tracked_max_retries.get(cli, 0), count
+                    )
 
     flagged_clis = sorted(
         cli
         for cli in (
-            set(pp_failures)
-            | set(pp_hangs)
-            | set(pp_silent_empty)
-            | {cli for cli, count in pp_max_retries.items() if count >= RETRY_STUCK_THRESHOLD}
+            set(tracked_failures)
+            | set(tracked_hangs)
+            | set(tracked_silent_empty)
+            | {
+                cli
+                for cli, count in tracked_max_retries.items()
+                if count >= RETRY_STUCK_THRESHOLD
+            }
         )
-        if VALID_PP_CLI_RE.match(cli)
-        and pp_cli_candidate_is_valid(cli, pp_root, plain_command_clis)
+        if VALID_TRACKED_CLI_RE.match(cli)
     )
     for cli in flagged_clis:
-        failures = pp_failures.get(cli, [])
-        hangs = pp_hangs.get(cli, [])
-        silent_empty = pp_silent_empty.get(cli, [])
-        invocations = pp_invocations.get(cli, [])
-        max_retries = pp_max_retries.get(cli, 0)
+        failures = tracked_failures.get(cli, [])
+        hangs = tracked_hangs.get(cli, [])
+        silent_empty = tracked_silent_empty.get(cli, [])
+        invocations = tracked_invocations.get(cli, [])
+        max_retries = tracked_max_retries.get(cli, 0)
         stuck = max_retries >= RETRY_STUCK_THRESHOLD
         evidence_items = (failures + hangs + silent_empty + invocations)[:12]
         session_count = len({ev.session_id for ev in evidence_items})
@@ -2233,13 +1871,6 @@ def generate_proposals(
             "contract, silent-null result, fragile auth flow, or syntax the agent had to "
             "guess and retry, fix the tool itself instead of working around it in a prompt."
         )
-        source = printing_press_source(cli, pp_root)
-        if source is not None:
-            action += (
-                f" This is a printing-press CLI; its source is at {source}. Open its "
-                "spec.yaml/README, then run /printing-press-amend to patch it (or "
-                "/printing-press-reprint to rebuild it from scratch)."
-            )
 
         proposals.append(
             make_proposal(
@@ -2436,9 +2067,6 @@ def generate_proposals(
             )
         )
 
-    if include_content:
-        proposals.extend(generate_content_proposals(sessions))
-
     return dedupe_proposals(proposals)
 
 
@@ -2453,9 +2081,33 @@ def first_executable(command: str) -> str:
     parts = command.strip().split()
     if not parts:
         return ""
+    shell_fragments = {
+        "#",
+        "case",
+        "do",
+        "done",
+        "else",
+        "esac",
+        "fi",
+        "for",
+        "function",
+        "if",
+        "in",
+        "then",
+        "while",
+        "}",
+    }
+    first = parts[0]
+    if (
+        first in shell_fragments
+        or first.startswith(("#", "}", ")"))
+        or first.endswith((")", "}", ";;"))
+        or "$(" in first
+    ):
+        return ""
+    if ENV_ASSIGNMENT_RE.match(first):
+        return parts[1] if len(parts) > 1 else ""
     if parts[0] in {"env", "command", "time"} and len(parts) > 1:
-        return parts[1]
-    if "=" in parts[0] and len(parts) > 1:
         return parts[1]
     return Path(parts[0]).name
 
@@ -2512,15 +2164,15 @@ def apply_config(cfg: Dict[str, Any]) -> None:
     Recognized keys: tracked_cli_suffix, extra_scaffold_markers,
     extra_redaction_patterns ([[regex, replacement], ...]),
     extra_backlog_ignore, extra_remote_command_wrappers,
-    include_subagent_failures, validate_pp_cli_candidates,
-    detect_silent_empty, silent_empty_fetch_verbs, silent_empty_ignore.
+    include_subagent_failures, detect_silent_empty, silent_empty_fetch_verbs,
+    silent_empty_ignore.
     """
-    global TRACKED_CLI_SUFFIX, PP_CLI_RE, VALID_PP_CLI_RE
-    global INCLUDE_SUBAGENT_FAILURES, VALIDATE_PP_CLI_CANDIDATES, DETECT_SILENT_EMPTY
+    global TRACKED_CLI_SUFFIX, TRACKED_CLI_RE, VALID_TRACKED_CLI_RE
+    global INCLUDE_SUBAGENT_FAILURES, DETECT_SILENT_EMPTY
     suffix = cfg.get("tracked_cli_suffix")
     if isinstance(suffix, str) and suffix:
         TRACKED_CLI_SUFFIX = suffix
-        PP_CLI_RE, VALID_PP_CLI_RE = _build_tracked_cli_res(suffix)
+        TRACKED_CLI_RE, VALID_TRACKED_CLI_RE = _build_tracked_cli_res(suffix)
     markers = cfg.get("extra_scaffold_markers")
     if isinstance(markers, list):
         EXTRA_SCAFFOLD_MARKERS.extend(str(m) for m in markers if m)
@@ -2541,8 +2193,6 @@ def apply_config(cfg: Dict[str, Any]) -> None:
         REMOTE_COMMAND_WRAPPERS.update(str(x) for x in wrappers)
     if isinstance(cfg.get("include_subagent_failures"), bool):
         INCLUDE_SUBAGENT_FAILURES = cfg["include_subagent_failures"]
-    if isinstance(cfg.get("validate_pp_cli_candidates"), bool):
-        VALIDATE_PP_CLI_CANDIDATES = cfg["validate_pp_cli_candidates"]
     if isinstance(cfg.get("detect_silent_empty"), bool):
         DETECT_SILENT_EMPTY = cfg["detect_silent_empty"]
     fetch_verbs = cfg.get("silent_empty_fetch_verbs")
@@ -2763,10 +2413,21 @@ def write_review_packet(
     parser_warnings: Optional[List[str]] = None,
     resolution_suppressed: Optional[List[Dict[str, Any]]] = None,
     regressions: Optional[List[Dict[str, Any]]] = None,
+    fleet_sources: Optional[List[Dict[str, Any]]] = None,
 ) -> Path:
     path = root / "review-packets" / f"{run_id}.md"
     resolution_suppressed = resolution_suppressed or []
     regressions = regressions or []
+    fleet_sources = fleet_sources or []
+    session_count = (
+        sum(int(item.get("sessions_with_signals", 0)) for item in fleet_sources)
+        if fleet_sources
+        else len(sessions)
+    )
+    machines = sorted(
+        {str(item.get("machine")) for item in fleet_sources if item.get("machine")}
+        or {session.machine for session in sessions if session.machine}
+    )
     suppressed_targets = sorted({item["target"] for item in resolution_suppressed})
     target_text = ", ".join(f"`{target}`" for target in suppressed_targets) or "none"
     lines = [
@@ -2788,7 +2449,8 @@ def write_review_packet(
         "",
         "## Summary",
         "",
-        f"- Sessions with signals: {len(sessions)}",
+        f"- Machines: {', '.join(machines) or 'unknown'}",
+        f"- Sessions with signals: {session_count}",
         f"- Proposals staged this run: {len(proposals)}",
         (
             f"- {len(resolution_suppressed)} proposals suppressed as already-resolved "
@@ -2827,31 +2489,160 @@ def write_review_packet(
         for ev in proposal["evidence"][:8]:
             loc = f"{ev['path']}:{ev['line']}"
             cmd = f" command=`{ev['command']}`" if ev.get("command") else ""
-            lines.append(f"  - `{ev['kind']}` {loc}{cmd} - {ev['excerpt']}")
+            machine = f" [{ev['machine']}]" if ev.get("machine") else ""
+            lines.append(f"  - `{ev['kind']}`{machine} {loc}{cmd} - {ev['excerpt']}")
         lines.append("")
 
-    if any(proposal.get("route") == "content_idea" for proposal in proposals):
-        lines.extend(
-            [
-                "## Content privacy notice",
-                "",
-                CONTENT_PRIVACY_NOTICE,
-                "",
-            ]
-        )
+    if fleet_sources:
+        lines.extend(["## Fleet Sources", ""])
+        for item in fleet_sources:
+            lines.append(
+                f"- `{item.get('machine', 'unknown')}` run=`{item.get('run_id', '')}` "
+                f"sessions={item.get('sessions_with_signals', 0)} "
+                f"proposals={item.get('proposal_count', 0)}"
+            )
+        lines.append("")
 
     lines.extend(["## Session Index", ""])
     for session in sessions[:200]:
         data = session.as_dict()
         lines.append(
-            f"- `{data['source']}` `{data['session_id']}` "
-            f"tools={data['tool_call_count']} pp={','.join(data['pp_cli_names']) or '-'} "
+            f"- `{data['machine'] or 'unknown'}` `{data['source']}` `{data['session_id']}` "
+            f"tools={data['tool_call_count']} tracked={','.join(data['tracked_cli_names']) or '-'} "
             f"skills={','.join(data['skill_names']) or '-'} failures={data['failure_count']} "
             f"corrections={data['correction_count']}"
         )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
     return path
+
+
+def write_fleet_bundle(
+    root: Path,
+    run_id: str,
+    machine: str,
+    result: Dict[str, Any],
+    proposals: List[Dict[str, Any]],
+) -> Optional[Path]:
+    """Write a redacted, self-contained handoff without copying transcripts."""
+    if FULL_DETAIL:
+        print("warning: --full disables fleet bundle output", file=sys.stderr)
+        return None
+    bundle = {
+        "schema_version": SCHEMA_VERSION,
+        "bundle_kind": "agent_improvement_redacted_proposals",
+        "redacted": True,
+        "machine": machine,
+        "run_id": run_id,
+        "started_at": result.get("started_at"),
+        "files_scanned": result.get("files_scanned", 0),
+        "sessions_with_signals": result.get("sessions_with_signals", 0),
+        "proposal_count": len(proposals),
+        "parser_warnings": redact_structure_for_fleet(result.get("parser_warnings", [])),
+        "proposals": redact_structure_for_fleet(proposals),
+    }
+    path = root / "fleet-outbox" / machine / f"{run_id}.json"
+    write_json(path, bundle)
+    return path
+
+
+def collect_fleet_bundles(args: argparse.Namespace) -> int:
+    """Merge the latest redacted bundle per Mac into one orchestrator packet."""
+    root = Path(args.output_root).expanduser()
+    inbox = Path(args.fleet_inbox).expanduser()
+    latest_by_machine: Dict[str, Dict[str, Any]] = {}
+    for path in sorted(inbox.glob("*/*.json")):
+        try:
+            bundle = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"warning: skipped invalid fleet bundle {path}: {exc}", file=sys.stderr)
+            continue
+        if not isinstance(bundle, dict) or bundle.get("redacted") is not True:
+            print(f"warning: skipped non-redacted fleet bundle {path}", file=sys.stderr)
+            continue
+        # Treat peer bundles as untrusted input. Re-sanitize every string even
+        # when the producer marked the bundle redacted so an older scanner or
+        # a missed evidence field cannot leak credentials into the fleet packet.
+        bundle = redact_structure_for_fleet(bundle)
+        machine = normalized_machine_name(str(bundle.get("machine") or path.parent.name))
+        run_id = str(bundle.get("run_id") or "")
+        if not run_id:
+            continue
+        current = latest_by_machine.get(machine)
+        if current is None or run_id > str(current.get("run_id") or ""):
+            latest_by_machine[machine] = bundle
+
+    if not latest_by_machine:
+        print(f"error: no valid redacted fleet bundles under {inbox}", file=sys.stderr)
+        return 2
+
+    fleet_sources: List[Dict[str, Any]] = []
+    proposals: List[Dict[str, Any]] = []
+    parser_warnings: List[str] = []
+    for machine, bundle in sorted(latest_by_machine.items()):
+        bundle_proposals = bundle.get("proposals")
+        if not isinstance(bundle_proposals, list):
+            bundle_proposals = []
+        fleet_sources.append(
+            {
+                "machine": machine,
+                "run_id": str(bundle.get("run_id") or ""),
+                "sessions_with_signals": int(bundle.get("sessions_with_signals") or 0),
+                "proposal_count": len(bundle_proposals),
+            }
+        )
+        parser_warnings.extend(
+            f"{machine}: {warning}" for warning in bundle.get("parser_warnings", [])
+        )
+        for original in bundle_proposals:
+            if not isinstance(original, dict):
+                continue
+            proposal = copy.deepcopy(original)
+            origin_id = str(proposal.get("proposal_id") or "")
+            proposal["origin_proposal_id"] = origin_id
+            proposal["proposal_id"] = f"{machine}-{origin_id}"
+            proposal["proposal_key"] = hashlib.sha256(
+                f"{machine}:{proposal.get('proposal_key', origin_id)}".encode()
+            ).hexdigest()[:20]
+            proposal["machines"] = [machine]
+            for item in proposal.get("evidence", []):
+                if isinstance(item, dict):
+                    item["machine"] = machine
+            proposals.append(proposal)
+
+    fleet_run_id = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ-fleet")
+    proposal_dir = root / "proposals" / fleet_run_id
+    for proposal in proposals:
+        write_json(proposal_dir / f"{proposal['proposal_id']}.json", proposal)
+    packet_path = write_review_packet(
+        root,
+        fleet_run_id,
+        [],
+        proposals,
+        parser_warnings,
+        fleet_sources=fleet_sources,
+    )
+    run_result = {
+        "schema_version": SCHEMA_VERSION,
+        "run_id": fleet_run_id,
+        "started_at": utc_now(),
+        "source": "fleet_redacted_bundles",
+        "machines": [item["machine"] for item in fleet_sources],
+        "sessions_with_signals": sum(
+            item["sessions_with_signals"] for item in fleet_sources
+        ),
+        "proposal_count": len(proposals),
+        "fleet_sources": fleet_sources,
+        "review_packet": str(packet_path),
+    }
+    write_json(root / "runs" / f"{fleet_run_id}.json", run_result)
+    print(
+        f"fleet_machines={','.join(run_result['machines'])} "
+        f"sessions_with_signals={run_result['sessions_with_signals']} "
+        f"proposals={len(proposals)}"
+    )
+    print(f"review_packet={packet_path}")
+    return 0
 
 
 TARGET_HISTORY_KEEP = 10
@@ -2981,6 +2772,28 @@ def filter_new_proposals(
     return ProposalFilterResult(emitted, suppressed, regressions, resolved_nonregressions)
 
 
+def proposals_for_fleet_snapshot(
+    detected: List[Dict[str, Any]],
+    state: Dict[str, Any],
+    resolutions: Optional[Dict[str, Dict[str, str]]] = None,
+    include_resolved: bool = False,
+) -> List[Dict[str, Any]]:
+    """Return all currently active proposals for a latest-wins fleet bundle.
+
+    Local packets remain delta-oriented, but collectors replace each machine's
+    prior bundle with its newest one. The bundle therefore must be a snapshot
+    of active unresolved proposals rather than only newly-seen proposal keys.
+    """
+    candidates = copy.deepcopy(detected)
+    return filter_new_proposals(
+        candidates,
+        state,
+        include_seen=True,
+        resolutions=resolutions,
+        include_resolved=include_resolved,
+    ).proposals
+
+
 def compute_since(args: argparse.Namespace, state: Dict[str, Any]) -> Optional[dt.datetime]:
     if args.all:
         return None
@@ -2997,6 +2810,7 @@ def scan(args: argparse.Namespace) -> int:
     FULL_DETAIL = bool(getattr(args, "full", False))
     home = Path(args.home).expanduser()
     homes = [home] + [Path(item).expanduser() for item in getattr(args, "extra_home", [])]
+    machine = normalized_machine_name(getattr(args, "machine", ""))
     root = Path(args.output_root).expanduser()
     config_path = Path(getattr(args, "config", "") or DEFAULT_CONFIG_PATH).expanduser()
     apply_config(load_config(config_path))
@@ -3027,15 +2841,56 @@ def scan(args: argparse.Namespace) -> int:
         stats["files"] += 1
         stats["tool_calls"] += len(parsed.tool_calls)
         if parsed.has_signal():
+            stamp_session_machine(parsed, machine)
             sessions.append(parsed)
+
+    hermes_db_count = 0
+    if args.source in {"all", "hermes_profile_log"}:
+        seen_dbs: set[Path] = set()
+        for scan_home in homes:
+            for db_path in discover_hermes_profile_dbs(scan_home):
+                resolved = db_path.resolve()
+                if resolved in seen_dbs:
+                    continue
+                seen_dbs.add(resolved)
+                hermes_db_count += 1
+                try:
+                    parsed_sessions = parse_hermes_profile_db(
+                        db_path,
+                        home=scan_home,
+                        since=since,
+                        max_sessions=(
+                            args.max_sessions if args.source == "hermes_profile_log" else 0
+                        ),
+                    )
+                except Exception as exc:
+                    print(f"warning: failed to parse Hermes profile DB {db_path}: {exc}", file=sys.stderr)
+                    continue
+                stats = parse_stats.setdefault(
+                    "hermes_profile_log", {"files": 0, "tool_calls": 0}
+                )
+                stats["files"] += 1
+                stats["tool_calls"] += sum(len(item.tool_calls) for item in parsed_sessions)
+                for item in parsed_sessions:
+                    stamp_session_machine(item, machine)
+                sessions.extend(parsed_sessions)
+
+    if args.max_sessions:
+        sessions = sorted(
+            sessions, key=lambda item: item.ended_at or item.started_at
+        )[-args.max_sessions :]
     parser_warnings = parser_health_warnings(parse_stats)
     for warning in parser_warnings:
         print(f"warning: {warning}", file=sys.stderr)
 
-    pp_root_arg = getattr(args, "printing_press_root", None)
-    pp_root = Path(pp_root_arg).expanduser() if pp_root_arg else None
-    detected = generate_proposals(sessions, pp_root, route=args.route)
+    detected = generate_proposals(sessions)
     annotate_recurrence(detected, state, resolutions)
+    fleet_proposals = proposals_for_fleet_snapshot(
+        detected,
+        state,
+        resolutions,
+        args.include_resolved,
+    )
     filtered = filter_new_proposals(
         detected,
         state,
@@ -3055,10 +2910,12 @@ def scan(args: argparse.Namespace) -> int:
         "run_id": run_id,
         "started_at": utc_now(),
         "source": args.source,
+        "machine": machine,
         "since": since.isoformat() if since else None,
-        "files_scanned": len(files),
+        "files_scanned": len(files) + hermes_db_count,
         "sessions_with_signals": len(sessions),
         "proposal_count": len(proposals),
+        "fleet_proposal_count": len(fleet_proposals),
         "resolved_suppressed_count": len(filtered.suppressed),
         "resolved_suppressed_targets": suppressed_targets,
         "regression_count": len(filtered.regressions),
@@ -3102,13 +2959,20 @@ def scan(args: argparse.Namespace) -> int:
     state["seen_proposal_keys"] = sorted(seen)
     write_json(root / "state.json", state)
     write_json(root / "runs" / f"{run_id}.json", {**result, "review_packet": str(packet_path)})
+    bundle_path = write_fleet_bundle(root, run_id, machine, result, fleet_proposals)
 
-    print(f"scanned={len(files)} sessions_with_signals={len(sessions)} proposals={len(proposals)}")
+    print(
+        f"machine={machine} scanned={result['files_scanned']} "
+        f"sessions_with_signals={len(sessions)} proposals={len(proposals)} "
+        f"fleet_proposals={len(fleet_proposals)}"
+    )
     print(
         f"resolved_suppressed={len(filtered.suppressed)} "
         f"targets={','.join(suppressed_targets) or '-'} regressions={len(filtered.regressions)}"
     )
     print(f"review_packet={packet_path}")
+    if bundle_path:
+        print(f"fleet_bundle={bundle_path}")
     if proposals:
         print(f"proposal_dir={proposal_dir}")
     return 0
@@ -3118,6 +2982,8 @@ def manage_resolutions(args: argparse.Namespace) -> int:
     root = Path(args.output_root).expanduser()
     actor = str(args.by or os.environ.get("USER") or "unknown")
     try:
+        if args.collect_fleet:
+            return collect_fleet_bundles(args)
         if args.list_resolutions:
             print(json.dumps(load_resolutions(root), ensure_ascii=False, indent=2, sort_keys=True))
             return 0
@@ -3157,7 +3023,7 @@ def manage_resolutions(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Scan Claude/Codex sessions and stage self-improvement proposals."
+        description="Scan local agent sessions and stage self-improvement proposals."
     )
     parser.add_argument("--home", default=str(Path.home()), help="Home directory containing .claude/.codex")
     parser.add_argument(
@@ -3167,12 +3033,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Additional home directory containing .claude/.codex logs, e.g. logs copied from another machine over ssh",
     )
     parser.add_argument("--output-root", default=str(DEFAULT_OUTPUT_ROOT), help="Proposal queue root")
-    parser.add_argument("--source", choices=["all", "claude", "codex"], default="all")
     parser.add_argument(
-        "--route",
-        choices=["all", "improvement", "content_idea"],
-        default="improvement",
-        help="Proposal route family to stage: operational improvements, content ideas, or both",
+        "--source",
+        choices=["all", "claude", "codex", "hermes_profile_log"],
+        default="all",
+    )
+    parser.add_argument(
+        "--machine",
+        default="",
+        help="Stable fleet machine name embedded in sessions, proposals, and redacted bundles",
     )
     parser.add_argument("--all", action="store_true", help="Backfill all discovered sessions")
     parser.add_argument("--since-days", type=float, default=None, help="Scan sessions modified within N days")
@@ -3185,20 +3054,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--full", action="store_true", help="Keep full, unredacted excerpts inline (local use only; do not share the output)")
     parser.add_argument(
-        "--printing-press-root",
-        default=os.environ.get("PRINTING_PRESS_ROOT", PRINTING_PRESS_ROOT_DEFAULT),
-        help="Root of the printing-press CLI tree; tool proposals point at the matching CLI source (default ~/printing-press)",
-    )
-    parser.add_argument(
         "--config",
         default=str(DEFAULT_CONFIG_PATH),
         help=(
             "JSON config overriding detector defaults (tracked_cli_suffix, "
             "extra_scaffold_markers, extra_redaction_patterns, extra_backlog_ignore, "
             "extra_remote_command_wrappers, include_subagent_failures, "
-            "validate_pp_cli_candidates, detect_silent_empty, "
-            "silent_empty_fetch_verbs, silent_empty_ignore)"
+            "detect_silent_empty, silent_empty_fetch_verbs, silent_empty_ignore)"
         ),
+    )
+    parser.add_argument(
+        "--fleet-inbox",
+        default=str(DEFAULT_OUTPUT_ROOT / "fleet-inbox"),
+        help="Root containing <machine>/<run-id>.json redacted fleet bundles",
     )
     parser.add_argument("--dry-run", action="store_true", help="Print JSON and do not write queue files")
     actions = parser.add_mutually_exclusive_group()
@@ -3206,6 +3074,11 @@ def build_parser() -> argparse.ArgumentParser:
     actions.add_argument("--resolve-from", metavar="PATH", help="Import structured decisions JSON")
     actions.add_argument("--list-resolutions", action="store_true", help="Print the resolutions registry")
     actions.add_argument("--unresolve", metavar="ROUTE:TARGET", help="Remove a target resolution")
+    actions.add_argument(
+        "--collect-fleet",
+        action="store_true",
+        help="Merge the latest redacted bundle per machine into one fleet review packet",
+    )
     parser.add_argument("--decision", choices=sorted(RESOLUTION_DECISIONS), help="Resolution decision")
     parser.add_argument("--resolved-at", help="Resolution watermark (ISO8601 UTC; default now)")
     parser.add_argument("--pr", help="Fix PR number or URL")
