@@ -699,6 +699,21 @@ class DailyImprovementLoopTests(unittest.TestCase):
             loop.is_user_correction_text("Actually, use the other worktree instead.")
         )
 
+    def test_quote_first_bridge_text_suppression_is_the_documented_gap(self):
+        # ACCEPTED LIMIT, pinned deliberately: a message whose FIRST line is
+        # bridge text is treated as bridge traffic even if a correction
+        # follows, because bridge bodies legitimately contain corrective
+        # language and no text-only rule separates the two (see the
+        # BRIDGE_ORIGIN_RE comment). If this assertion ever flips, that is a
+        # semantic change to the filter's boundary and needs review, not a
+        # silent pass.
+        self.assertFalse(
+            loop.is_user_correction_text(
+                "From Codex pane w1:p1: report only whether you are writing.\n"
+                "That's wrong - you should have replied."
+            )
+        )
+
     def test_correction_quoting_a_bridge_line_is_still_detected(self):
         # \A anchoring, not multiline ^: a real Sawyer correction that QUOTES a
         # bridge message on a later line must not be suppressed (over-suppression

@@ -100,6 +100,18 @@ TRANSCRIPT_TIMESTAMP_RE = re.compile(r"\[\d{1,2}:\d{2}(?::\d{2})?\]")
 # Anchored to the very start of the message (\A, not multiline ^): a real
 # correction that QUOTES a bridge line later in its text must not be
 # suppressed.
+#
+# DOCUMENTED GAP (accepted limit, 2026-08-28 review round 3): a correction
+# whose FIRST line is pasted bridge text is indistinguishable, on text alone,
+# from a genuine bridge message — bridge bodies legitimately contain
+# corrective language (Codex critiquing the agent), so keying on cues after
+# the marker would reinstate the original false-positive class this filter
+# exists to kill. That side costs a bogus skill_improvement proposal every
+# bridge exchange (observed 5 runs straight); this side costs one missed
+# proposal in the rare paste-bridge-first-then-correct shape, and Sawyer's
+# corrections do not arrive that way (bridge text reaches transcripts by
+# herdr injection, not manual paste). If that habit ever changes, revisit
+# rather than widen the regex.
 BRIDGE_ORIGIN_RE = re.compile(
     r"\A\s*(?:from|origin:)\s+\S+\s+pane\s+w\d+:p\d+\b", re.IGNORECASE
 )
