@@ -87,6 +87,15 @@ MAX_CORRECTIONS_PER_SESSION = 3
 # that would otherwise count as correction cues.
 TRANSCRIPT_SPEAKER_RE = re.compile(r"<b>\s*speaker\s*\d+", re.IGNORECASE)
 TRANSCRIPT_TIMESTAMP_RE = re.compile(r"\[\d{1,2}:\d{2}(?::\d{2})?\]")
+# herdr bridge-pane traffic: agent-to-agent requests relayed into the prompt
+# stream. The bridge contract requires the sender to open by naming its origin
+# pane ("From Codex pane w1:p1: ..." / "Origin: Codex pane w1:p1"), so the
+# marker is definitive — and a bridge message is never Sawyer, so it can never
+# be a user correction, however corrective its wording reads ("do not ...").
+# Line-anchored and limited to the message head so a real correction that
+# merely mentions panes is not suppressed.
+BRIDGE_ORIGIN_RE = re.compile(r"(?im)^\s*(?:from|origin:)\s+\S+\s+pane\s+w\d+:p\d+\b")
+BRIDGE_ORIGIN_SCAN_CHARS = 240
 FAILURE_RE = re.compile(
     r"("
     r"exit code:\s*[1-9]|non-zero|command not found|no such file|"
@@ -644,6 +653,8 @@ def is_user_correction_text(text: str, path: Optional[Path] = None) -> bool:
     if not text or is_transcript_scaffold(text, path) or looks_like_pasted_transcript(text):
         return False
     stripped = text.strip()
+    if BRIDGE_ORIGIN_RE.search(stripped[:BRIDGE_ORIGIN_SCAN_CHARS]):
+        return False
     # A proposal must show the phrase that triggered it. Searching beyond the
     # normal evidence excerpt turns appended runtime instructions into
     # invisible false positives that a reviewer cannot validate.

@@ -675,6 +675,40 @@ class DailyImprovementLoopTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertFalse(loop.is_user_correction_text(text))
 
+    def test_bridge_pane_messages_are_not_user_corrections(self):
+        # herdr bridge traffic is agent-to-agent, never Sawyer. Both documented
+        # marker shapes, including the verbatim evidence line behind the
+        # imp-f2cf93/imp-8120e0 false positives (flagged 5 straight runs).
+        bridge_messages = [
+            "From Codex pane w1:p1: I am starting a bounded multi-repo batch. "
+            "Do not make changes and do not prompt another agent.",
+            "Origin: Codex pane w1:p1\nActually, use the other worktree instead.",
+            "From Claude pane w2:p3: that's wrong, you missed the lockfile.",
+        ]
+        for text in bridge_messages:
+            with self.subTest(text=text):
+                self.assertFalse(loop.is_user_correction_text(text))
+
+    def test_same_correction_without_bridge_marker_still_detected(self):
+        # Mutation guard: the bridge filter must be the ONLY reason the texts
+        # above are suppressed. Identical corrective wording from Sawyer counts.
+        self.assertTrue(
+            loop.is_user_correction_text("that's wrong, you missed the lockfile.")
+        )
+        self.assertTrue(
+            loop.is_user_correction_text("Actually, use the other worktree instead.")
+        )
+
+    def test_pane_mention_mid_text_does_not_suppress_a_real_correction(self):
+        # Line-anchored marker: a genuine correction that merely TALKS about a
+        # bridge message must not be filtered.
+        self.assertTrue(
+            loop.is_user_correction_text(
+                "That's wrong - the message from Codex pane w1:p1 was a status "
+                "request, you should have replied instead of editing."
+            )
+        )
+
     def test_actually_inside_a_question_is_not_a_correction(self):
         self.assertFalse(
             loop.is_user_correction_text(
