@@ -1,0 +1,3 @@
+# Redaction-test fixtures: synthetic sequential string (a1b2c3...) used to prove masking works.
+8036dbeabce631b8053c432d97fae0f9ceca1ed7:scripts/test_daily_improvement_loop.py:generic-api-key:2061
+8036dbeabce631b8053c432d97fae0f9ceca1ed7:scripts/test_daily_improvement_loop.py:generic-api-key:2159
